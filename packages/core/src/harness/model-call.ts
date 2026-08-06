@@ -1007,6 +1007,7 @@ export class AgentHarnessModelCaller {
       harness: this.opts.harness,
       layers: request.layers,
       callId: fc.callId,
+      resolvedTool: toolForCall,
     });
     // Owner-scoped result validation: a tool's `toolResults` schemas apply
     // only to that tool's own result items. Harness-level `opts.itemSchemas`

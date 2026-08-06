@@ -333,6 +333,12 @@ export interface ExecuteToolCallParams {
   layers?: ContextLayer[];
   /** The model's `function_call` id — keys this call's tool-UI region. */
   callId?: string;
+  /**
+   * Pre-resolved tool for `toolName`. When the caller already looked the tool
+   * up (the model-call loop does, for spans), pass it here to skip a second
+   * linear scan + sanitize-per-compare pass.
+   */
+  resolvedTool?: Tool;
 }
 
 function isAsyncGenerator(value: unknown): value is AsyncGenerator<unknown, unknown> {
@@ -353,9 +359,11 @@ export async function executeToolCall(params: ExecuteToolCallParams): Promise<{
   // `plan/updatePrd` used by steering whitelists, skill docs, and the
   // `planContext.beforeToolCall` hook) stays intact while the wire name is
   // provider-compliant.
-  const matchedTool = params.tools.find(
-    (t) => t.name === params.toolName || sanitizeToolNameForWire(t.name) === params.toolName,
-  );
+  const matchedTool =
+    params.resolvedTool ??
+    params.tools.find(
+      (t) => t.name === params.toolName || sanitizeToolNameForWire(t.name) === params.toolName,
+    );
   if (!matchedTool) {
     return {
       output: `Error: unknown tool '${params.toolName}'`,
@@ -363,11 +371,29 @@ export async function executeToolCall(params: ExecuteToolCallParams): Promise<{
     };
   }
 
+  // Validate model-provided arguments against the tool's declared Zod input
+  // schema BEFORE anything runs. This is the single point where untrusted
+  // model output crosses into user code; a structured validation error back
+  // to the model beats a tool throwing halfway through side effects — models
+  // self-correct on good error messages. The programmatic `call-tool` path
+  // (`executeTool`) has always validated here; this closes the asymmetry.
+  const parsed = matchedTool.input.safeParse(params.args);
+  if (!parsed.success) {
+    const issues = parsed.error.issues
+      .map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`)
+      .join('; ');
+    return {
+      output: `Error: invalid arguments for '${matchedTool.name}': ${issues}`,
+      error: true,
+    };
+  }
+  const args = parsed.data;
+
   if (params.layers && params.layers.length > 0) {
     const decision = await params.harness.beforeToolCall(
       params.layers,
       params.toolName,
-      params.args,
+      args,
       params.context,
     );
     if (decision.action === SteeringAction.Deny) {
@@ -392,7 +418,7 @@ export async function executeToolCall(params: ExecuteToolCallParams): Promise<{
           ctx: params.context,
           tool: matchedTool,
           callId,
-          args: params.args,
+          args,
         }
       : undefined;
   if (uiBase) {
@@ -402,7 +428,7 @@ export async function executeToolCall(params: ExecuteToolCallParams): Promise<{
     });
   }
   try {
-    const executionResult = matchedTool.execute(params.args, toolCtx);
+    const executionResult = matchedTool.execute(args, toolCtx);
     // Generator tools stream progress; drive them here so tool-UI `progress`
     // fragments emit per yield (the non-UI case just consumes to the return).
     let result: unknown;
