@@ -187,6 +187,19 @@ export { createInMemoryStorage } from './runtime/in-memory-storage';
 //#region Patterns
 
 /** @public */
+export type {
+  Agent,
+  AgentDef,
+  AsToolOptions,
+  HandoffOptions,
+  QuorumCandidate,
+  QuorumOptions,
+  QuorumVote,
+  Teammate,
+} from './patterns/agents';
+/** @public */
+export { asTool, defineAgent, handoff, quorum, teammate } from './patterns/agents';
+/** @public */
 export type { DynamicWorkflowOpts, ParseAndRunWorkflowOpts } from './patterns/dynamic-workflow';
 /** @public */
 export { dynamicWorkflow, parseAndRunWorkflow } from './patterns/dynamic-workflow';
