@@ -1,10 +1,20 @@
 import { describe, expect, test } from 'bun:test';
-import type { Channel, InputMessageItem } from '@noetic-tools/types';
+import type { Channel, InputMessageItem, StreamEvent } from '@noetic-tools/types';
 import { isNoeticError } from '@noetic-tools/types';
 import { z } from 'zod';
 import { ChannelStore } from '../../src/runtime/channel-store';
 import { ContextImpl, collectContextTree } from '../../src/runtime/context-impl';
+import { EventBroadcaster } from '../../src/runtime/event-broadcaster';
 import { makeMockContext, makeMockHarness } from '../_helpers';
+
+/** Drain a broadcaster to completion. Start before emitting, await after. */
+async function collectStreamEvents(broadcaster: EventBroadcaster): Promise<StreamEvent[]> {
+  const events: StreamEvent[] = [];
+  for await (const event of broadcaster) {
+    events.push(event);
+  }
+  return events;
+}
 
 function makeTestItem(): InputMessageItem {
   return {
@@ -471,6 +481,84 @@ describe('collectContextTree', () => {
     const foreign = makeMockContext();
     expect(collectContextTree(foreign)).toEqual([
       foreign,
+    ]);
+  });
+});
+
+describe('ContextImpl frontier bookkeeping drift (D6)', () => {
+  /**
+   * `leaveStep` popping a frame that is not the one it expected means every
+   * `currentPath()` computed after it is suspect, which silently degrades the
+   * ledger keys resume depends on (replay misses re-run their steps — the safe
+   * direction — but resume quality drops). A bare `console.warn` leaves a host
+   * grepping stderr; the framework event makes it observable.
+   */
+  test('emits a context:frontier_drift framework event on a mismatched pop', async () => {
+    const broadcaster = new EventBroadcaster();
+    const events = collectStreamEvents(broadcaster);
+    const ctx = new ContextImpl({
+      harness: makeMockHarness(),
+      _broadcaster: broadcaster,
+    });
+
+    ctx.enterStep({
+      stepId: 'outer',
+      input: undefined,
+    });
+    ctx.enterStep({
+      stepId: 'inner',
+      input: undefined,
+    });
+    const pathAtDrift = ctx.currentPath();
+    // Pop naming the OUTER step while `inner` is on top — the drift case.
+    ctx.leaveStep('outer');
+    broadcaster.complete();
+
+    const drift = (await events).filter(
+      (e) => e.source === 'framework' && e.type === 'context:frontier_drift',
+    );
+    expect(drift).toHaveLength(1);
+    expect(drift[0]?.data).toEqual({
+      expectedStepId: 'outer',
+      actualStepId: 'inner',
+      path: pathAtDrift,
+    });
+  });
+
+  test('a matching pop emits nothing', async () => {
+    const broadcaster = new EventBroadcaster();
+    const events = collectStreamEvents(broadcaster);
+    const ctx = new ContextImpl({
+      harness: makeMockHarness(),
+      _broadcaster: broadcaster,
+    });
+
+    ctx.enterStep({
+      stepId: 'only',
+      input: undefined,
+    });
+    ctx.leaveStep('only');
+    broadcaster.complete();
+
+    expect(await events).toEqual([]);
+  });
+
+  test('drift without a broadcaster still unwinds rather than throwing', () => {
+    const ctx = new ContextImpl({
+      harness: makeMockHarness(),
+    });
+    ctx.enterStep({
+      stepId: 'outer',
+      input: undefined,
+    });
+    ctx.enterStep({
+      stepId: 'inner',
+      input: undefined,
+    });
+    ctx.leaveStep('outer');
+    // One frame popped best-effort; the outer frame is still in flight.
+    expect(ctx.serialiseFrontier().map((f) => f.stepId)).toEqual([
+      'outer',
     ]);
   });
 });

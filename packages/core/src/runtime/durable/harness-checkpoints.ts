@@ -33,6 +33,8 @@ export type RestoreCheckpointOptions = RestoreContextOptions & {
  */
 export interface CheckpointHarnessHandle {
   readonly checkpointStore?: CheckpointStore;
+  /** Per-harness item-log watermarks (see {@link ItemLogPersistence}). */
+  readonly itemLogPersistence: ItemLogPersistence;
   readonly stepLedgerStore?: StepLedgerStore;
   readonly stepLedgerRetention?: StepLedgerRetention;
   readonly layerStateStore: LayerStateStore;
@@ -52,6 +54,79 @@ export interface CheckpointHarnessHandle {
 //#region captureCheckpoint
 
 /**
+ * Per-owner watermarks of how many items have already been persisted as
+ * append-only batches. Item-log persistence is O(delta) per checkpoint rather
+ * than O(full log): each checkpoint writes only the items appended since the
+ * previous one under `execution:<ownerKey>:itemLog:<offset>`. `restore`
+ * stitches the batches back together in order. In-memory state — after a host
+ * restart the map is empty and the first checkpoint of a resumed execution
+ * writes one catch-up batch (the offset in the key makes that idempotent).
+ *
+ * One instance PER HARNESS, never module-global: two harnesses with different
+ * checkpoint stores but a colliding threadId ('main' is a natural choice)
+ * would otherwise share a watermark, and whichever store is behind the shared
+ * count would silently under-persist forever.
+ *
+ * `rollback` is the failed-turn seam: the session runner truncates the shared
+ * session log back to the turn watermark, and any batch persisted mid-turn now
+ * describes items the live log no longer has. The watermark must come back
+ * with it — and the stale over-watermark batch must be superseded — or every
+ * subsequent checkpoint would diff against a durable log that is ahead of the
+ * live one (writing nothing while restore resurrects the rolled-back items).
+ *
+ * @internal
+ */
+export class ItemLogPersistence {
+  private readonly counts = new Map<string, number>();
+
+  get(ownerKey: string): number {
+    return this.counts.get(ownerKey) ?? 0;
+  }
+
+  set(ownerKey: string, count: number): void {
+    this.counts.set(ownerKey, count);
+  }
+
+  /**
+   * A turn rolled the live log back to `length`. Clamp the watermark so the
+   * next checkpoint re-persists from the truncation point. The store's batch
+   * keys embed the offset, so the catch-up batch overwrites the stale one at
+   * the same offset; `loadItems` honours `persistedCount` from the snapshot,
+   * which is written from this clamped value, so a residual tail batch past
+   * the clamp is never stitched back in.
+   */
+  rollback(ownerKey: string, length: number): void {
+    const current = this.counts.get(ownerKey);
+    if (current !== undefined && current > length) {
+      this.counts.set(ownerKey, length);
+    }
+  }
+
+  /** Drop an owner's watermark (session teardown). */
+  delete(ownerKey: string): void {
+    this.counts.delete(ownerKey);
+  }
+}
+
+/**
+ * Item batches are keyed by THREAD, not execution: the session owns the log
+ * (one shared ItemLog across every turn in a thread), so its durable form is
+ * thread-scoped too. A per-execution key would reset the delta watermark on
+ * every turn (each turn creates a fresh executionId) and re-write the whole
+ * transcript — O(n²) again, just spread across keys.
+ *
+ * Takes the two identity fields structurally rather than a whole `Context`, so
+ * a caller holding only a threadId (the session) or only a persisted snapshot
+ * (restore) can build the same key. `threadId` is optional here because a
+ * snapshot's is: threadless one-shot executions fall back to `execution:<id>`.
+ *
+ * @internal
+ */
+export function itemLogOwnerKey(owner: { threadId?: string; id: string }): string {
+  return owner.threadId ? `thread:${owner.threadId}` : `execution:${owner.id}`;
+}
+
+/**
  * Snapshot the execution state at a checkpoint boundary. No-op when no
  * `CheckpointStore` is configured — zero-config harnesses preserve
  * ephemeral semantics. Save failures are logged rather than thrown,
@@ -65,13 +140,43 @@ export async function captureCheckpoint(h: CheckpointHarnessHandle, ctx: Context
   if (!store) {
     return;
   }
+  /* The frontier is written for observability only (a host inspecting a crashed
+   * execution can see what was in flight); restore never reads it — resume
+   * re-enters from the root with the ledger replaying completed steps. Frame
+   * `input`/`state` can embed arbitrarily large step inputs, so cap what one
+   * checkpoint will carry rather than serialize a fork's whole payload on
+   * every completed step. */
   const impl = ctx instanceof ContextImpl ? ctx : null;
-  const frontier: FrontierFrame[] = impl ? impl.serialiseFrontier() : [];
+  const frontier: FrontierFrame[] = impl
+    ? impl.serialiseFrontier().map((frame) => ({
+        stepId: frame.stepId,
+        input: undefined,
+      }))
+    : [];
   const layers: Record<string, unknown> = {};
   for (const layer of ctx.layers ?? []) {
     const state = h.layerStateStore.get<unknown>(ctx.id, layer.id);
     if (state !== undefined) {
       layers[layer.id] = state;
+    }
+  }
+  // Persist the item-log DELTA as an append-only batch. The snapshot itself
+  // carries only the count (`itemLog.persistedCount`) — never the items — so
+  // snapshot size and write cost stay O(layers + frontier) instead of O(n)
+  // as the transcript grows (previously O(n²) over a session).
+  const allItems = ctx.itemLog.items;
+  const ownerKey = itemLogOwnerKey(ctx);
+  const already = h.itemLogPersistence.get(ownerKey);
+  if (allItems.length > already && store.appendItems) {
+    const batch = allItems.slice(already);
+    try {
+      await store.appendItems(ownerKey, already, [
+        ...batch,
+      ]);
+      h.itemLogPersistence.set(ownerKey, allItems.length);
+    } catch (err) {
+      console.warn(`AgentHarness.checkpoint: failed to persist item batch for "${ownerKey}":`, err);
+      // Fall through: the snapshot still records the last durable count.
     }
   }
   const snapshot: CheckpointSnapshot = {
@@ -90,11 +195,17 @@ export async function captureCheckpoint(h: CheckpointHarnessHandle, ctx: Context
     // via `AskUserService` integration. Carrying the shape from day one
     // means future producers don't bump the schema version.
     askUser: [],
-    itemLog: {
-      items: [
-        ...ctx.itemLog.items,
-      ],
-    },
+    itemLog: store.appendItems
+      ? {
+          items: [],
+          persistedCount: h.itemLogPersistence.get(ownerKey),
+        }
+      : {
+          // Legacy stores without appendItems keep the inline (O(n)) shape.
+          items: [
+            ...allItems,
+          ],
+        },
     capturedAt: new Date().toISOString(),
   };
   try {
@@ -148,7 +259,24 @@ export async function restoreFromCheckpoint(
   for (const [layerId, state] of Object.entries(snapshot.layers)) {
     h.layerStateStore.set(executionId, layerId, state);
   }
-  const items: Item[] = h.itemSchemas.parseMany(snapshot.itemLog.items);
+  let rawItems: unknown[] = snapshot.itemLog.items;
+  const persistedCount = snapshot.itemLog.persistedCount ?? 0;
+  if (persistedCount > 0 && store.loadItems) {
+    /* Derived from the SNAPSHOT's threadId, not the executionId argument: capture
+     * wrote the batches under the log's owner key, so restore has to read the
+     * same one or it finds nothing and the resumed session comes back empty. */
+    const ownerKey = itemLogOwnerKey({
+      threadId: snapshot.threadId,
+      id: executionId,
+    });
+    rawItems = await store.loadItems(ownerKey, persistedCount);
+    /* Seed the delta watermark so the next checkpoint appends from the right
+     * offset instead of re-writing history. Clamped to what was actually
+     * recovered: on a short/torn read the watermark must track the real durable
+     * prefix, so the next checkpoint re-persists the gap. */
+    h.itemLogPersistence.set(ownerKey, Math.min(persistedCount, rawItems.length));
+  }
+  const items: Item[] = h.itemSchemas.parseMany(rawItems);
   const cwdInit = snapshot.cwd?.current ?? undefined;
   /* Caller wiring first, snapshot second: a host may legitimately swap the context
    * layers or hang the restored execution under a new parent, but it must never be

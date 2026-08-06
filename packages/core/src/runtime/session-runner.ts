@@ -41,6 +41,13 @@ export interface SessionRunnerOpts {
   readonly agentName: string;
   readonly runTurn: RunTurnFn;
   readonly createContext: CreateContextFn;
+  /**
+   * Roll back session-owned state after a failed/aborted turn. With a shared
+   * session log (single-owner history), a failed turn's partial items must be
+   * discarded explicitly to preserve the "failed turns leave no trace"
+   * contract the old copy-back gave for free.
+   */
+  readonly rollbackTurn?: () => void;
 }
 
 //#endregion
@@ -110,6 +117,7 @@ export class SessionRunner {
   private readonly agentName: string;
   private readonly runTurn: RunTurnFn;
   private readonly createContext: CreateContextFn;
+  private readonly rollbackTurn?: () => void;
 
   private status: HarnessStatus = {
     kind: 'idle',
@@ -129,6 +137,7 @@ export class SessionRunner {
     this.agentName = opts.agentName;
     this.runTurn = opts.runTurn;
     this.createContext = opts.createContext;
+    this.rollbackTurn = opts.rollbackTurn;
 
     this.queue.subscribe(() => {
       this.kick();
@@ -279,6 +288,7 @@ export class SessionRunner {
     } catch (err: unknown) {
       const error = err instanceof Error ? err : new Error(String(err));
       this.lastError = error;
+      this.rollbackTurn?.();
       emitFrameworkEvent({
         broadcaster: this.broadcaster,
         agentName: this.agentName,

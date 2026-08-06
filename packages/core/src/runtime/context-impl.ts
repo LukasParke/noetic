@@ -155,6 +155,13 @@ export class ContextImpl implements Context<ContextData> {
     harness: AgentHarnessContract;
     parent?: Context;
     items?: Item[];
+    /**
+     * Share an existing log instead of building a fresh one from `items`.
+     * The session runner passes its session-owned log here so every turn in a
+     * thread appends to ONE log — no copy-forward/copy-back per turn.
+     * Mutually exclusive with `items`.
+     */
+    itemLog?: ItemLogImpl;
     state?: unknown;
     threadId?: string;
     resourceId?: string;
@@ -200,13 +207,17 @@ export class ContextImpl implements Context<ContextData> {
     };
     this._broadcaster = opts._broadcaster;
 
-    const log = new ItemLogImpl(this.itemSchemas);
-    if (opts.items) {
-      for (const item of opts.items) {
-        log.append(item);
+    if (opts.itemLog) {
+      this.itemLog = opts.itemLog;
+    } else {
+      const log = new ItemLogImpl(this.itemSchemas);
+      if (opts.items) {
+        for (const item of opts.items) {
+          log.append(item);
+        }
       }
+      this.itemLog = log;
     }
-    this.itemLog = log;
 
     // Join the parent's abort cascade last, so the child is fully constructed
     // before an already-aborted parent aborts it.
@@ -409,11 +420,23 @@ export class ContextImpl implements Context<ContextData> {
   leaveStep(expectedStepId: string): void {
     const top = this._frontier[this._frontier.length - 1];
     if (top && top.stepId !== expectedStepId) {
-      // A mismatch indicates bookkeeping drift. We unwind best-effort and
-      // let the caller observe via `serialiseFrontier()` if needed.
+      /* Bookkeeping drift: from here every `currentPath()` this turn computes is
+       * suspect, which silently degrades ledger keys (replay misses re-run their
+       * steps — the safe direction — but resume quality drops). Unwind
+       * best-effort AND surface a framework event so hosts can see it happening,
+       * not just grep stderr after the fact. */
       console.warn(
         `ContextImpl.leaveStep: expected "${expectedStepId}" on top of frontier but saw "${top.stepId}".`,
       );
+      this._broadcaster?.emit({
+        source: 'framework',
+        type: 'context:frontier_drift',
+        data: {
+          expectedStepId,
+          actualStepId: top.stepId,
+          path: this.currentPath(),
+        },
+      });
     }
     this._frontier.pop();
     this._segments.pop();

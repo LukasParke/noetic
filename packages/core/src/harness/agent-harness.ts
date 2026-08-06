@@ -26,6 +26,7 @@ import {
   recallLayers,
   recallLayersAtomic,
   recallLayersEventual,
+  registerDurableTargets,
   resolveLayerTools,
   runAppendPipeline,
   storeLayers,
@@ -57,6 +58,9 @@ import {
   createStepLedgerStore,
   filterReasoningStream,
   filterTextStream,
+  ItemLogImpl,
+  ItemLogPersistence,
+  itemLogOwnerKey,
   resolveStepLedgerRetention,
   restoreFromCheckpoint,
   SessionRunner,
@@ -188,7 +192,14 @@ interface AgentHarnessOpts<TParams extends Record<string, unknown> = Record<stri
 
 interface Session {
   readonly runner: SessionRunner;
-  accumulatedItems: Item[];
+  /**
+   * The single session-owned conversation log. Every turn's context shares
+   * this instance by reference — there is no per-turn copy-forward or
+   * copy-back, and `previewRequestItems` reads the same object the turn
+   * writes. Failed/aborted turns are rolled back to a watermark by the
+   * runner so they leave no trace, preserving the old copy semantics.
+   */
+  readonly log: ItemLogImpl;
 }
 
 //#endregion
@@ -399,6 +410,13 @@ export class AgentHarness<TParams extends Record<string, unknown> = Record<strin
    */
   readonly stepLedgerStore?: StepLedgerStore;
   /**
+   * Per-harness item-log persistence watermarks for O(delta) checkpoint
+   * batches. Harness-scoped (never module-global) so two harnesses with
+   * colliding threadIds cannot poison each other's delta accounting.
+   * @internal
+   */
+  readonly itemLogPersistence = new ItemLogPersistence();
+  /**
    * Resolved retention bounds for that ledger. Validated at construction so a bad cap
    * is a loud config error rather than a run that silently records nothing.
    * @internal
@@ -438,6 +456,8 @@ export class AgentHarness<TParams extends Record<string, unknown> = Record<strin
    * `ctx.id` (the layer-state store's executionId).
    */
   private readonly initializedExecutions = new Set<string>();
+  /** threadId+layerset → last hydrated executionId (warm layer-state carry-forward). */
+  private readonly hydratedThreads = new Map<string, string>();
   /**
    * Memoized unified tool pool for the session turn path. `initialStep` and
    * `harnessTools` are readonly and set once in the constructor, and
@@ -612,9 +632,23 @@ export class AgentHarness<TParams extends Record<string, unknown> = Record<strin
 
   seedSessionHistory(threadId: string, items: ReadonlyArray<Item>): void {
     const session = this.getOrCreateSession(threadId);
-    session.accumulatedItems = [
-      ...items,
-    ];
+    // Seeding replaces history: reset then append into the shared log. The
+    // persistence watermark resets with it — the seeded log shares no prefix
+    // with whatever was persisted before, so the next checkpoint must
+    // re-persist from index 0 rather than diff against stale batches.
+    session.log.truncateTo(0);
+    this.itemLogPersistence.rollback(
+      itemLogOwnerKey({
+        threadId,
+        // Never read: `itemLogOwnerKey` only falls back to `execution:<id>`
+        // when threadId is falsy, and we always have one here.
+        id: '',
+      }),
+      0,
+    );
+    for (const item of items) {
+      session.log.append(item);
+    }
   }
 
   private getOrCreateSession(threadId: string): Session {
@@ -623,8 +657,12 @@ export class AgentHarness<TParams extends Record<string, unknown> = Record<strin
       return existing;
     }
 
+    const sessionLog = new ItemLogImpl(this.itemSchemas);
+    // Watermark captured at turn start (before the turn's input lands); a
+    // failed turn truncates back to it so partial items leave no trace.
+    let turnWatermark = 0;
     const session: Session = {
-      accumulatedItems: [],
+      log: sessionLog,
       runner: new SessionRunner({
         threadId,
         agentName: this.config.name,
@@ -635,12 +673,14 @@ export class AgentHarness<TParams extends Record<string, unknown> = Record<strin
         // time and doesn't apply here.
         createContext: (items, _turnId, messages) => {
           const perTurnOptions: ExecuteOptions = messages[0]?.options ?? {};
-          const allItems: Item[] = [
-            ...session.accumulatedItems,
-            ...items,
-          ];
+          // Append this turn's input to the SESSION log and hand the same log
+          // to the context — single owner, zero per-turn copies.
+          turnWatermark = sessionLog.length;
+          for (const item of items) {
+            sessionLog.append(item);
+          }
           const ctx = this.createContext({
-            items: allItems,
+            itemLog: sessionLog,
             threadId,
             resourceId: perTurnOptions.resourceId,
             state: perTurnOptions.state,
@@ -665,6 +705,21 @@ export class AgentHarness<TParams extends Record<string, unknown> = Record<strin
           }
           return ctx;
         },
+        rollbackTurn: () => {
+          sessionLog.truncateTo(turnWatermark);
+          /* A mid-turn checkpoint may have persisted items this truncation just
+           * discarded. Roll the delta watermark back with the log, so the next
+           * checkpoint re-persists from the truncation point (its batch key
+           * embeds the offset, superseding the stale batch) instead of
+           * diffing against a durable log that is ahead of the live one. */
+          this.itemLogPersistence.rollback(
+            itemLogOwnerKey({
+              threadId,
+              id: '',
+            }),
+            turnWatermark,
+          );
+        },
         runTurn: async (ctx, _turn, signal) => {
           if (!this.initialStep) {
             throw new NoeticConfigError({
@@ -688,10 +743,6 @@ export class AgentHarness<TParams extends Record<string, unknown> = Record<strin
             );
           }
           const result = await this.initAndRun(this.initialStep, '', ctx);
-          // Snapshot final items into session history for the next turn.
-          session.accumulatedItems = [
-            ...ctx.itemLog.items,
-          ];
           return result;
         },
       }),
@@ -797,8 +848,19 @@ export class AgentHarness<TParams extends Record<string, unknown> = Record<strin
    * treated as disabled. Guarded so nested/repeated `run()` calls and the
    * session turn path never re-init — re-init would re-hydrate from storage and
    * clobber accumulated in-memory state.
+   *
+   * Turns on the same thread take the WARM path: layer state carries forward
+   * in-memory rather than being re-read from storage (sequential reads, each
+   * with a 10s timeout, every turn). `transient: true` opts a throwaway context
+   * out of publishing itself as the thread's warm source — see
+   * `previewRequestItems`, which tears its execution's state down again.
    */
-  private async ensureLayersInit(ctx: Context): Promise<void> {
+  private async ensureLayersInit(
+    ctx: Context,
+    opts?: {
+      transient?: boolean;
+    },
+  ): Promise<void> {
     const layers = ctx.layers;
     const storage = this.config.storage;
     if (!layers || layers.length === 0 || !storage) {
@@ -808,7 +870,83 @@ export class AgentHarness<TParams extends Record<string, unknown> = Record<strin
       return;
     }
     this.initializedExecutions.add(ctx.id);
+    // Keyed on the LAYER SET as well as the thread: a context configured with
+    // different layers has nothing to carry forward from one that was not.
+    const warmKey = `${ctx.threadId}::${layers.map((l) => l.id).join(',')}`;
+    if (
+      await this.tryWarmInit({
+        warmKey,
+        layers,
+        ctx,
+        storage,
+      })
+    ) {
+      if (!opts?.transient) {
+        this.hydratedThreads.set(warmKey, ctx.id);
+      }
+      return;
+    }
     await this.initLayers(layers, ctx, storage);
+    if (!opts?.transient) {
+      this.hydratedThreads.set(warmKey, ctx.id);
+    }
+  }
+
+  /**
+   * Warm path: a previous turn on this thread already hydrated these layers
+   * from storage. Copy the live in-memory state forward to the new executionId
+   * instead of re-running every init. The state store is the source of truth
+   * between turns — its durable write-through keeps storage in sync.
+   *
+   * Returns whether the warm path handled init. `false` means nothing was
+   * carried forward (no prior turn, or its state was torn down) and the caller
+   * must cold-init.
+   */
+  private async tryWarmInit({
+    warmKey,
+    layers,
+    ctx,
+    storage,
+  }: {
+    warmKey: string;
+    layers: ContextLayer[];
+    ctx: Context;
+    storage: StorageAdapter;
+  }): Promise<boolean> {
+    const warm = this.hydratedThreads.get(warmKey);
+    if (!warm || warm === ctx.id) {
+      return false;
+    }
+    let copied = 0;
+    for (const layer of layers) {
+      // Execution-scoped layers are per-run by contract — always re-init.
+      if (layer.scope === 'execution') {
+        continue;
+      }
+      if (this.layerStateStore.has?.(warm, layer.id)) {
+        this.layerStateStore.set(ctx.id, layer.id, this.layerStateStore.get(warm, layer.id));
+        copied++;
+      }
+    }
+    if (copied === 0) {
+      return false;
+    }
+    // Re-run init ONLY for layers not carried forward (execution-scoped or
+    // never initialised), then re-register durable targets for the new
+    // execution id so write-through keeps flowing.
+    const cold = layers.filter(
+      (l) => l.scope === 'execution' || !this.layerStateStore.has?.(ctx.id, l.id),
+    );
+    if (cold.length > 0) {
+      await this.initLayers(cold, ctx, storage);
+    }
+    registerDurableTargets({
+      layers: layers.filter((l) => l.scope !== 'execution'),
+      ctx: this.toExecCtx(ctx),
+      storage,
+      store: this.layerStateStore,
+    });
+    return true;
   }
 
   detachedSpawn<I, O>(
@@ -827,6 +965,8 @@ export class AgentHarness<TParams extends Record<string, unknown> = Record<strin
   createContext(opts?: {
     parent?: Context;
     items?: Item[];
+    /** @internal Share the session-owned log instead of seeding from `items`. */
+    itemLog?: ItemLogImpl;
     state?: unknown;
     threadId?: string;
     resourceId?: string;
@@ -1029,7 +1169,7 @@ export class AgentHarness<TParams extends Record<string, unknown> = Record<strin
     const existingSession = this.sessions.get(threadId);
     const historyItems: Item[] = existingSession
       ? [
-          ...existingSession.accumulatedItems,
+          ...existingSession.log.items,
         ]
       : [];
     const ctx = this.createContext({
@@ -1042,7 +1182,14 @@ export class AgentHarness<TParams extends Record<string, unknown> = Record<strin
       return historyItems;
     }
     try {
-      await this.ensureLayersInit(ctx);
+      /* `transient`: this context's state is torn down in the `finally` below, so
+       * it must NOT become the thread's warm-hydration source — a real turn that
+       * followed it would find a pointer to wiped state, carry nothing forward,
+       * and silently cold-init (correct, but the warm win evaporates after any
+       * preview, which a TUI may issue on every keystroke). */
+      await this.ensureLayersInit(ctx, {
+        transient: true,
+      });
       const recallResults = await this.recallLayers(layers, '', ctx);
       // Band the output the way a real turn would, but read-only: a preview
       // must not pin, count churn, or age the epoch, or looking at a
@@ -1100,6 +1247,14 @@ export class AgentHarness<TParams extends Record<string, unknown> = Record<strin
     // Drop the init guard so a deliberate dispose→run cycle re-hydrates from
     // storage (disposeLayers also clears the layer-state store for this id).
     this.initializedExecutions.delete(ctx.id);
+    // ...and any warm pointer aimed at this execution, whose state is about to
+    // be wiped. A stale pointer only degrades to a cold init, but dropping it
+    // here keeps the two guards from disagreeing about what is hydrated.
+    for (const [warmKey, executionId] of this.hydratedThreads) {
+      if (executionId === ctx.id) {
+        this.hydratedThreads.delete(warmKey);
+      }
+    }
     await disposeLayers({
       layers,
       ctx: this.toExecCtx(ctx),
@@ -1112,7 +1267,7 @@ export class AgentHarness<TParams extends Record<string, unknown> = Record<strin
   /**
    * Snapshot the execution state at a checkpoint boundary.
    *
-   * Fires at four well-defined points on the happy path:
+   * Fires at three well-defined points on the happy path:
    *   1. End of every `execute()` that mutated the item log — so a crash
    *      between turns lands on a snapshot that includes the user/assistant
    *      items that actually flowed.
@@ -1121,8 +1276,11 @@ export class AgentHarness<TParams extends Record<string, unknown> = Record<strin
    *      adapter's handle manifest.
    *   3. After an ask-user enqueue — a restart can replay the pending modal
    *      to the TUI.
-   *   4. After `runAppendPipeline` — layer state can mutate as items land,
-   *      so the snapshot must follow the mutation.
+   *
+   * `runAppendPipeline` is deliberately NOT a boundary: the turn-end snapshot
+   * persists the same layer state and the item-log delta writer covers the
+   * appended input, so snapshotting there doubled per-turn I/O for no
+   * recovery gain.
    *
    * Delegates to `captureCheckpoint` / `restoreFromCheckpoint` in
    * `runtime/durable/harness-checkpoints` so the ~140 lines of snapshot
@@ -1334,8 +1492,10 @@ export class AgentHarness<TParams extends Record<string, unknown> = Record<strin
       log: ctx.itemLog,
       store: this.layerStateStore,
     });
-    // Layer state can mutate as items land, so the snapshot must follow the fold.
-    await this.checkpoint(ctx);
+    /* NOT a checkpoint boundary any more. The turn-end checkpoint persists the
+     * same layer state, and the item-log delta writer (captureCheckpoint's
+     * append-only batches) covers the appended input — snapshotting the whole
+     * execution here doubled per-turn checkpoint I/O for no recovery gain. */
     return piped;
   }
 

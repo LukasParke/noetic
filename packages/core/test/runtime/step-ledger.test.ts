@@ -538,6 +538,59 @@ describe('step ledger retention config', () => {
     expect(await ledgerKeys(storage, 'exec')).toHaveLength(3);
   });
 
+  it('a storage-outage burst of failed appends never evicts live entries (D3)', async () => {
+    /* Failed appends reserve sequence numbers but store no rows. If the eviction
+     * window counted those gaps as live entries, a clustered outage would push the
+     * window over maxEntries and delete that many REAL oldest entries. */
+    const storage = createInMemoryStorage();
+    const store = createStepLedgerStore({
+      storage,
+    });
+    let failing = false;
+    const flaky: typeof store = {
+      ...store,
+      append: async (executionId, seq, entry) => {
+        if (failing) {
+          throw new Error('storage outage');
+        }
+        return store.append(executionId, seq, entry);
+      },
+    };
+    const ledger = new StepLedger({
+      executionId: 'exec',
+      store: flaky,
+      retention: {
+        maxEntries: 5,
+      },
+    });
+
+    // 5 live entries — exactly at the cap.
+    for (let i = 0; i < 5; i++) {
+      await ledger.record(entryOfBytes(`live-${i}`, 8));
+    }
+    // An outage burst: 10 appends fail, each reserving a seq (gap, no row).
+    failing = true;
+    for (let i = 0; i < 10; i++) {
+      await ledger.record(entryOfBytes(`lost-${i}`, 8));
+    }
+    failing = false;
+
+    // Every live entry must still be in storage: gaps are not live entries.
+    expect(await ledgerKeys(storage, 'exec')).toHaveLength(5);
+    expect(ledger.stats.evicted).toBe(0);
+
+    // Recording one more live entry evicts exactly one (the true oldest),
+    // stepping over the gap seqs without phantom deletions.
+    await ledger.record(entryOfBytes('live-5', 8));
+    const retained = [
+      ...(await store.load('exec')).entries.keys(),
+    ];
+    expect(retained).toHaveLength(5);
+    expect(retained).not.toContain('live-0');
+    expect(retained).toContain('live-5');
+    expect(ledger.stats.evicted).toBe(1);
+  });
+
   it('gives concurrent records distinct keys', async () => {
     /* Fork legs record through the one shared ledger while in flight together. If the
      * sequence number were read after an await they would land on the same key and one

@@ -17,6 +17,7 @@ export {
   recallLayers,
   recallLayersAtomic,
   recallLayersEventual,
+  registerDurableTargets,
   resolveLayerTools,
   runAppendPipeline,
   storeLayers,

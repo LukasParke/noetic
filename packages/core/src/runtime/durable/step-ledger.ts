@@ -270,6 +270,15 @@ export class StepLedger {
   private seq: number;
   /** Lowest sequence number still in storage — advances as eviction proceeds. */
   private oldestSeq: number;
+  /**
+   * Sequence numbers reserved by appends that FAILED — gaps with no stored row.
+   * Without this, the eviction window (`seq - oldestSeq`) counts every gap as a
+   * live entry, and a burst of storage failures (an outage window) would make
+   * eviction delete that many REAL oldest entries to satisfy a phantom count.
+   * Bounded by the number of failed writes still inside the window; entries
+   * leave the set as eviction's cursor passes them.
+   */
+  private readonly gapSeqs = new Set<number>();
   private readonly store?: StepLedgerStore;
   private readonly executionId: string;
   private readonly retention: Required<StepLedgerRetention>;
@@ -352,14 +361,15 @@ export class StepLedger {
     }
     /* Reserve the sequence number BEFORE awaiting: concurrent fork legs record through
      * the one shared ledger, and two of them reading the same counter would write the
-     * same key, silently overwriting a sibling's entry. A write that then fails leaves a
-     * gap, which only makes the window below a slight over-estimate of the live count —
-     * eviction runs marginally early, never late. */
+     * same key, silently overwriting a sibling's entry. A write that then fails is
+     * remembered as a gap so the eviction window doesn't count it as a live entry —
+     * a clustered outage would otherwise evict that many real entries. */
     const seq = this.seq;
     this.seq = seq + 1;
     try {
       await this.store.append(this.executionId, seq, entry);
     } catch (error) {
+      this.gapSeqs.add(seq);
       console.warn(
         `StepLedger: failed to record "${entry.path}":`,
         error instanceof Error ? error.message : String(error),
@@ -409,8 +419,14 @@ export class StepLedger {
     if (!store) {
       return;
     }
-    while (this.seq - this.oldestSeq > this.retention.maxEntries) {
+    while (this.seq - this.oldestSeq - this.gapCountInWindow() > this.retention.maxEntries) {
       const victim = this.oldestSeq;
+      /* A known gap has no stored row: advance past it without a delete round
+       * trip, and without counting it as an eviction. */
+      if (this.gapSeqs.delete(victim)) {
+        this.oldestSeq = victim + 1;
+        continue;
+      }
       try {
         await store.delete(this.executionId, victim);
       } catch (error) {
@@ -425,6 +441,23 @@ export class StepLedger {
       this.oldestSeq = victim + 1;
       this.counts.evicted += 1;
     }
+  }
+
+  /** Gaps still inside the live window — phantom rows the count must exclude. */
+  private gapCountInWindow(): number {
+    if (this.gapSeqs.size === 0) {
+      return 0;
+    }
+    let n = 0;
+    for (const gap of this.gapSeqs) {
+      if (gap >= this.oldestSeq) {
+        n += 1;
+      } else {
+        // The cursor already passed it; it can never be consulted again.
+        this.gapSeqs.delete(gap);
+      }
+    }
+    return n;
   }
 
   /** One warning per reason per execution — a long run would otherwise flood the log. */

@@ -13,9 +13,11 @@ export const CheckpointSchemaVersion = 1;
 
 /**
  * @public
- * One entry in the execution frontier — a pointer to a step currently in
- * flight on the parent's stack, plus the input/state snapshot required to
- * resume it.
+ * One entry in the execution frontier — a pointer to a step that was in
+ * flight at capture time. Diagnostic: restore does not consume frames (resume
+ * re-enters from the root; the step ledger replays completed work), so the
+ * capture path records `stepId` only. `input`/`state` remain in the schema
+ * for old snapshots and hosts that serialise richer frames themselves.
  *
  * The frontier is intentionally lenient: frame `state` is treated as an
  * opaque JSON value because step `state` is user-defined. Parse/validate at
@@ -73,6 +75,13 @@ export type PendingAskUserSnapshot = z.infer<typeof PendingAskUserSnapshotSchema
  */
 export const ItemLogSnapshotSchema = z.object({
   items: z.array(z.unknown()),
+  /**
+   * When present, the item log lives OUTSIDE the snapshot as append-only
+   * batches (`execution:<ownerKey>:itemLog:<offset>`); `items` is empty and
+   * this counts the durable items to stitch back on restore. Absent on legacy
+   * inline snapshots.
+   */
+  persistedCount: z.number().int().nonnegative().optional(),
 });
 
 /** @public Item log portion of a snapshot. */
@@ -89,7 +98,13 @@ export const CheckpointSnapshotSchema = z.object({
   executionId: z.string(),
   threadId: z.string().optional(),
   resourceId: z.string().optional(),
-  frontier: z.array(FrontierFrameSchema),
+  /**
+   * In-flight step frames at capture time. DIAGNOSTIC ONLY: restore never
+   * consumes it — resume re-enters from the tree root and the step ledger
+   * replays completed work. Optional (default `[]`) so the hot capture path
+   * can omit it; old snapshots that carry one still parse.
+   */
+  frontier: z.array(FrontierFrameSchema).default([]),
   layers: z.record(z.string(), z.unknown()),
   cwd: CwdSnapshotSchema.nullable(),
   askUser: z.array(PendingAskUserSnapshotSchema),
