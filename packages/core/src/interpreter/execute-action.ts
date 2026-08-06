@@ -417,6 +417,12 @@ function finalizeStepOutput<O>(params: {
  * Returns the new "already emitted" state, so the caller tracks the once-only
  * guarantee without branching on it: a steering retry re-sends the same view, so
  * re-emitting would only repeat itself.
+ *
+ * The latch closes only on an ACTUAL emission. An assembly that stayed under the
+ * threshold (or whose event a `shouldEmit` filter rejected) leaves the flag as it
+ * found it — otherwise a first assembly with room to spare would disarm the event
+ * for the rest of the step, and a steering retry that appended enough to cross
+ * `compactAt` would trim the oldest turns in the silence the event exists to break.
  */
 function emitContextPressureOnce(params: {
   historyItems: ReadonlyArray<Item>;
@@ -431,7 +437,7 @@ function emitContextPressureOnce(params: {
   }
   const pressure = historyPressure(params.historyItems, params.policy);
   if (!pressure.overThreshold) {
-    return true;
+    return params.alreadyEmitted;
   }
   const data = {
     nodeId: params.nodeId,
@@ -439,7 +445,7 @@ function emitContextPressureOnce(params: {
     compactAt: pressure.compactAt,
   };
   if (!shouldEmit(params.emit, 'context_pressure', data)) {
-    return true;
+    return params.alreadyEmitted;
   }
   emitFrameworkEvent({
     broadcaster: getBroadcaster(params.ctx),
@@ -469,6 +475,69 @@ function historyForBareRequest(params: {
   return [
     ...params.projected,
   ];
+}
+
+/** The layer-bearing path's two history bands, split out of the projected log. */
+interface PartitionedHistory {
+  /** System messages, hoisted to the front. Never dropped by the budget. */
+  systemItems: Item[];
+  /** Everything else, compactions folded. */
+  historyItems: Item[];
+}
+
+/**
+ * Split the projected log into the system band and the history band, folding any
+ * recorded compaction on the way.
+ *
+ * Order of operations matters twice over:
+ *
+ * 1. The fold runs on the WHOLE projected array, because
+ *    `CompactionItem.replacesUntil` indexes the log the record was created
+ *    against (`ctx.itemLog.items`). Folding a system/tail-stripped array would
+ *    apply that index to a shorter list, so the cut point lands past its
+ *    intended position and silently eats one live turn per stripped item — and
+ *    the same log would then produce a different history depending on whether
+ *    layers are configured, since `historyForBareRequest` folds unstripped.
+ * 2. System items are hoisted from the array as it stood BEFORE the fold, so a
+ *    compaction whose covered prefix happens to include the system prompt still
+ *    leaves the model its instructions. They are then skipped when the folded
+ *    result is walked, so each appears exactly once — in the band the budget
+ *    never trims.
+ *
+ * The fold renders the winning compaction as a `developer` message carrying a
+ * fresh id, so neither the system test nor the tail test below can claim it and
+ * the summary always reaches history.
+ */
+function partitionProjectedHistory(params: {
+  projected: ReadonlyArray<Item>;
+  tailIds: ReadonlySet<string>;
+}): PartitionedHistory {
+  const systemItems: Item[] = [];
+  for (const item of params.projected) {
+    if (item.type === 'message' && item.role === 'system') {
+      systemItems.push(item);
+    }
+  }
+  const folded = hasCompaction(params.projected)
+    ? foldCompactions(params.projected)
+    : params.projected;
+  const historyItems: Item[] = [];
+  for (const item of folded) {
+    // Hoisted above, into a band that is never dropped.
+    if (item.type === 'message' && item.role === 'system') {
+      continue;
+    }
+    // Steering guidance is re-placed at the tail; skip it here so the retry
+    // does not see the same correction twice.
+    if ('id' in item && typeof item.id === 'string' && params.tailIds.has(item.id)) {
+      continue;
+    }
+    historyItems.push(item);
+  }
+  return {
+    systemItems,
+    historyItems,
+  };
 }
 
 export async function executeLLM<TContext, I, O>(
@@ -653,30 +722,18 @@ export async function executeLLM<TContext, I, O>(
     let assembledItems: ReadonlyArray<Item>;
     if (hasLayers) {
       // Keep system messages at the front; the projector enforces the token
-      // budget (drops highest-slot layer output, then oldest history).
-      const systemItems: Item[] = [];
-      const nonSystemHistory: Item[] = [];
-      const tailIds = new Set(steeringTail.map((i) => i.id));
-      for (const item of projectedHistoryItems) {
-        if (item.type === 'message' && item.role === 'system') {
-          systemItems.push(item);
-          continue;
-        }
-        // Steering guidance is re-placed at the tail; skip it here so the retry
-        // does not see the same correction twice.
-        if ('id' in item && typeof item.id === 'string' && tailIds.has(item.id)) {
-          continue;
-        }
-        nonSystemHistory.push(item);
-      }
-      // Fold recorded compactions BEFORE the bands claim their budget: a
-      // compaction that replaced 400 turns with a paragraph should shrink what
+      // budget (drops highest-slot layer output, then oldest history). Recorded
+      // compactions are folded on the way, BEFORE the bands claim their budget:
+      // a compaction that replaced 400 turns with a paragraph should shrink what
       // the assembler has to fit, not just sit in the log. Folding here rather
       // than inside assembleView keeps the band signature untouched.
-      const foldedHistory = foldCompactions(nonSystemHistory);
+      const { systemItems, historyItems } = partitionProjectedHistory({
+        projected: projectedHistoryItems,
+        tailIds: new Set(steeringTail.map((i) => i.id)),
+      });
       // Announce the trim that is coming, before the assembler performs it.
       pressureEmitted = emitContextPressureOnce({
-        historyItems: foldedHistory,
+        historyItems,
         policy: viewPolicy,
         nodeId: step.id,
         emit: step.emit,
@@ -686,7 +743,7 @@ export async function executeLLM<TContext, I, O>(
       assembledItems = assembleView({
         systemPromptItems: systemItems,
         layerOutputItems: banded.anchorItems,
-        historyItems: foldedHistory,
+        historyItems,
         liveLayerItems: banded.liveItems,
         deltaItems: banded.deltaItems,
         tailItems: steeringTail,
