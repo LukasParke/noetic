@@ -144,14 +144,208 @@ describe('observationalContext', () => {
   });
 });
 
-describe('observationalContext timeouts (M8)', () => {
-  it('pins LLM-headroom timeouts for store AND onItemAppend', () => {
+describe('observationalContext deferred distillation (M8, redesigned)', () => {
+  function assistantItem(text: string): MessageItem {
+    return {
+      id: 'a1',
+      type: 'message',
+      role: 'assistant',
+      status: 'completed',
+      content: [
+        {
+          type: 'output_text',
+          text,
+        },
+      ],
+    };
+  }
+
+  const emptyResponse = {
+    items: [],
+    usage: {
+      inputTokens: 0,
+      outputTokens: 0,
+    },
+  };
+
+  it('declares no LLM-headroom timeouts — distillation runs off the turn path', () => {
     const layer = observationalContext();
-    // Both hooks run the same LLM-backed accumulate path; onItemAppend must
-    // not be limited by the 5s pipeline default.
-    expect(layer.timeouts).toEqual({
-      store: 60_000,
-      onItemAppend: 60_000,
+    // The observer is fire-and-collect now: hooks only append to the buffer,
+    // so the default hook timeouts are sufficient and the turn never blocks
+    // on an LLM distillation call.
+    expect('timeouts' in layer).toBe(false);
+  });
+
+  it('crossing the threshold with an observer clears the buffer without blocking', async () => {
+    let resolveObserver: ((v: string[]) => void) | undefined;
+    const layer = observationalContext({
+      bufferThreshold: 1,
+      observer: () =>
+        new Promise<string[]>((resolve) => {
+          resolveObserver = resolve;
+        }),
     });
+    const ctx = makeCtx();
+    const before = Date.now();
+    const result = await layer.hooks.store({
+      newItems: [
+        assistantItem('a long enough assistant answer to cross the threshold'),
+      ],
+      log: makeItemLog(),
+      response: emptyResponse,
+      ctx,
+      state: {
+        observations: [],
+        buffer: [],
+        bufferTokens: 0,
+        version: 0,
+      },
+    });
+    // Returned immediately (no await on the observer)...
+    expect(Date.now() - before).toBeLessThan(1_000);
+    expect(result.state.buffer).toEqual([]);
+    expect(result.state.observations).toEqual([]);
+
+    // ...and the observation lands on a later hook once the observer resolves.
+    assert(resolveObserver);
+    resolveObserver([
+      'deferred fact',
+    ]);
+    await Bun.sleep(1);
+
+    const drained = await layer.hooks.store({
+      newItems: [],
+      log: makeItemLog(),
+      response: emptyResponse,
+      ctx,
+      state: result.state,
+    });
+    expect(drained.state.observations).toEqual([
+      'deferred fact',
+    ]);
+    // The drain bumps version so downstream churn tracking sees the change.
+    expect(drained.state.version).toBe(result.state.version + 1);
+  });
+
+  it('a failed distillation drops its batch instead of stalling the turn', async () => {
+    const layer = observationalContext({
+      bufferThreshold: 1,
+      observer: () => Promise.reject(new Error('observer exploded')),
+    });
+    const ctx = makeCtx();
+    const result = await layer.hooks.store({
+      newItems: [
+        assistantItem('enough text to cross the tiny threshold'),
+      ],
+      log: makeItemLog(),
+      response: emptyResponse,
+      ctx,
+      state: {
+        observations: [],
+        buffer: [],
+        bufferTokens: 0,
+        version: 0,
+      },
+    });
+    expect(result.state.buffer).toEqual([]);
+    await Bun.sleep(1);
+
+    const after = await layer.hooks.store({
+      newItems: [],
+      log: makeItemLog(),
+      response: emptyResponse,
+      ctx,
+      state: result.state,
+    });
+    expect(after.state.observations).toEqual([]);
+  });
+
+  it('keeps deferred batches keyed per scope so resources cannot cross-contaminate', async () => {
+    // One layer instance is shared across every resource on a harness, while
+    // its state is stored per scope key. A single shared bucket would drain
+    // resource A's distillation into resource B's observations.
+    let resolveA: ((v: string[]) => void) | undefined;
+    const layer = observationalContext({
+      bufferThreshold: 1,
+      observer: () =>
+        new Promise<string[]>((resolve) => {
+          resolveA = resolve;
+        }),
+    });
+    const ctxA = makeCtx({
+      resourceId: 'user-a',
+    });
+    const ctxB = makeCtx({
+      resourceId: 'user-b',
+    });
+    const emptyState = {
+      observations: [],
+      buffer: [],
+      bufferTokens: 0,
+      version: 0,
+    };
+
+    const a1 = await layer.hooks.store({
+      newItems: [
+        assistantItem('resource A text long enough to cross the threshold'),
+      ],
+      log: makeItemLog(),
+      response: emptyResponse,
+      ctx: ctxA,
+      state: emptyState,
+    });
+    assert(resolveA);
+    resolveA([
+      'A-only fact',
+    ]);
+    await Bun.sleep(1);
+
+    // B drains its own (empty) bucket — A's batch must not appear here.
+    const b1 = await layer.hooks.store({
+      newItems: [],
+      log: makeItemLog(),
+      response: emptyResponse,
+      ctx: ctxB,
+      state: emptyState,
+    });
+    expect(b1.state.observations).toEqual([]);
+
+    // A still gets it.
+    const a2 = await layer.hooks.store({
+      newItems: [],
+      log: makeItemLog(),
+      response: emptyResponse,
+      ctx: ctxA,
+      state: a1.state,
+    });
+    expect(a2.state.observations).toEqual([
+      'A-only fact',
+    ]);
+  });
+
+  it('recall never mutates state, so a drained batch cannot demote the anchor band', async () => {
+    // `bandFor` forces the live band for any layer whose recall returns state.
+    // Draining in store/onItemAppend keeps recall pure and the layer anchorable.
+    const layer = observationalContext();
+    const state = {
+      observations: [
+        'known fact',
+      ],
+      buffer: [],
+      bufferTokens: 0,
+      version: 1,
+    };
+    const recall = await layer.hooks.recall({
+      log: makeItemLog(),
+      query: '',
+      ctx: makeCtx(),
+      state,
+      budget: 1_000,
+    });
+    assert(recall);
+    // `state` is absent from recall's return type entirely, so the lifecycle's
+    // `result.state !== undefined` mutatedState check can never fire here.
+    expect(Object.hasOwn(recall, 'state')).toBe(false);
+    expect(recall.items.length).toBe(1);
   });
 });

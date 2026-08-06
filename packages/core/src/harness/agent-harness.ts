@@ -438,6 +438,14 @@ export class AgentHarness<TParams extends Record<string, unknown> = Record<strin
    * `ctx.id` (the layer-state store's executionId).
    */
   private readonly initializedExecutions = new Set<string>();
+  /**
+   * Memoized unified tool pool for the session turn path. `initialStep` and
+   * `harnessTools` are readonly and set once in the constructor, and
+   * `collectAllTools` is a pure structural walk (array-form `step.tools` only —
+   * function-form tools are skipped and resolved per execution), so there is
+   * nothing dynamic to freeze here.
+   */
+  private _unifiedToolsCache?: ReadonlyArray<Tool>;
   readonly traceExporter: TraceExporter;
   /**
    * Long-lived shared cwd state. The same reference is seeded into every
@@ -644,11 +652,16 @@ export class AgentHarness<TParams extends Record<string, unknown> = Record<strin
           ext._sessionBetweenRounds = true;
           ext._sessionRunnerAgentName = this.config.name;
           if (this.initialStep || this.harnessTools.length > 0) {
-            const stepTools = this.initialStep ? collectAllTools(this.initialStep) : [];
-            this.setUnifiedTools(ctx, [
-              ...stepTools,
+            // Memoized: the step tree and harness tools are fixed for the
+            // harness lifetime, so walk the tree once, not on every turn.
+            // Insertion order is preserved → the serialized tool block stays
+            // byte-identical across turns (prompt-cache stability for the
+            // tools segment, same argument as tail-placed context).
+            this._unifiedToolsCache ??= [
+              ...(this.initialStep ? collectAllTools(this.initialStep) : []),
               ...this.harnessTools,
-            ]);
+            ];
+            this.setUnifiedTools(ctx, this._unifiedToolsCache);
           }
           return ctx;
         },
@@ -897,7 +910,7 @@ export class AgentHarness<TParams extends Record<string, unknown> = Record<strin
   }
 
   /** Resolves layer-provided tools and merges with step tools into ctx.unifiedTools. */
-  private setUnifiedTools(ctx: Context, stepTools: Tool[]): void {
+  private setUnifiedTools(ctx: Context, stepTools: ReadonlyArray<Tool>): void {
     const layers = ctx.layers;
     const layerTools = layers && layers.length > 0 ? resolveLayerTools(layers, this, ctx) : [];
     const allTools = deduplicateTools([

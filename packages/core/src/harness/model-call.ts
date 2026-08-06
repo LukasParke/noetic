@@ -320,6 +320,49 @@ function hasSessionQueue(ctx: Context): ctx is Context & Required<SessionCtxExte
 
 //#endregion
 
+/**
+ * Per-Tool SDK conversion cache. Tool objects are stable for the harness
+ * lifetime (builders create them once), so converting each tool once and
+ * reusing the SDK definition keeps per-call work O(tools present) with zero
+ * re-serialization — and guarantees the SDK sees the identical definition
+ * object every round/turn (byte-stable tools segment for provider prompt
+ * caches).
+ */
+const sdkToolCache = new WeakMap<Tool, ReturnType<typeof convertTools>[number]>();
+
+function convertToolsCached(tools: ReadonlyArray<Tool>): ReturnType<typeof convertTools> {
+  const out: ReturnType<typeof convertTools> = [];
+  let misses: Tool[] | null = null;
+  for (const t of tools) {
+    const hit = sdkToolCache.get(t);
+    if (hit) {
+      out.push(hit);
+      continue;
+    }
+    misses ??= [];
+    misses.push(t);
+  }
+  if (!misses) {
+    return out;
+  }
+  // Convert misses in one pass, then rebuild in the caller's order.
+  for (const t of misses) {
+    const [converted] = convertTools({
+      tools: [
+        t,
+      ],
+    });
+    sdkToolCache.set(t, converted);
+  }
+  return tools.map((t) => {
+    const cached = sdkToolCache.get(t);
+    if (!cached) {
+      throw new Error(`convertToolsCached: missing conversion for ${t.name}`);
+    }
+    return cached;
+  });
+}
+
 interface PreparedModelRequest {
   instructions?: string;
   remaining: ReadonlyArray<Item>;
@@ -347,11 +390,7 @@ function prepareModelRequest(request: CallModelRequest, agentName: string): Prep
   // `parameters` keys stay camelCase: the SDK's outbound zod schema strips
   // unknown keys, so snake_case would be silently dropped.
   const clientSdkTools =
-    filteredTools && filteredTools.length > 0
-      ? convertTools({
-          tools: filteredTools,
-        })
-      : [];
+    filteredTools && filteredTools.length > 0 ? convertToolsCached(filteredTools) : [];
   const serverSdkTools = (request._serverTools ?? []).map((s) =>
     serverTool(
       frameworkCast<Parameters<typeof serverTool>[0]>({

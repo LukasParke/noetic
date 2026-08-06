@@ -1235,9 +1235,16 @@ describe('fileReference', () => {
   });
 
   describe('append-pipeline timeout headroom + parallel scoring (M8)', () => {
-    it('factory pins onItemAppend timeout at 30s (fs + LLM work cannot fit the 5s default)', () => {
-      const layer = fileReference();
-      expect(layer.timeouts?.onItemAppend).toBe(30_000);
+    it('sizes the onItemAppend timeout to the work actually configured', () => {
+      // Default is heuristic-only scoring: fs reads fit a tighter budget than
+      // the 5s pipeline default allows, but need nothing like 30s.
+      expect(fileReference().timeouts?.onItemAppend).toBe(10_000);
+      // Opting into LLM scoring adds a model round-trip per new reference.
+      expect(
+        fileReference({
+          scoringModel: 'anthropic/claude-haiku-4-5-20251001',
+        }).timeouts?.onItemAppend,
+      ).toBe(30_000);
     });
 
     it('scores multiple new references in parallel (wall time ≪ sequential), all tracked', async () => {
@@ -1248,6 +1255,9 @@ describe('fileReference', () => {
 
       const layer = fileReference({
         baseDir: tempDir,
+        // Required: LLM scoring is opt-in, so without a model the scoring path
+        // never runs and the wall-clock parallelism assertion below is vacuous.
+        scoringModel: 'test/scorer',
       });
       const store = createLayerStateStore();
       const ctx = makeCtx({

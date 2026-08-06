@@ -1,4 +1,4 @@
-import type { ContextLayer } from '@noetic-tools/types';
+import type { ContextLayer, ExecutionContext } from '@noetic-tools/types';
 import {
   collectInputText,
   collectOutputText,
@@ -6,6 +6,7 @@ import {
   estimateTokens,
   Slot,
 } from '@noetic-tools/types';
+import { resolveScopeKey } from '../scope';
 
 export interface ObservationalState {
   observations: string[];
@@ -32,6 +33,43 @@ interface AccumulateConfig {
   threshold: number;
   maxObs: number;
   observer?: ObserverFn;
+  /** Background-distillation bucket for the current scope key. */
+  deferred: DeferredDistill;
+}
+
+/**
+ * In-flight background distillations for one scope key. Results drain into
+ * state on the next `store` / `onItemAppend` — distillation is eventually
+ * visible, never turn-blocking. An LLM-backed observer used to add its full
+ * round-trip latency to the user's turn (both hooks awaited it, with 60s
+ * timeouts); now the turn pays only the buffer append.
+ *
+ * Keyed per scope key rather than per layer instance: one layer instance is
+ * shared across every thread/resource on a harness, while its state is stored
+ * per scope, so a single shared bucket would drain resource A's distillation
+ * into resource B's observations.
+ */
+interface DeferredDistill {
+  pending: Promise<string[]>[];
+  ready: string[][];
+}
+
+/** Fold completed background batches into `observations`. Returns `s` unchanged
+ *  (identity-comparable) when nothing has completed. */
+function drainReady(s: ObservationalState, d: DeferredDistill, maxObs: number): ObservationalState {
+  if (d.ready.length === 0) {
+    return s;
+  }
+  const batches = d.ready.splice(0, d.ready.length);
+  const observations = [
+    ...s.observations,
+    ...batches.flat(),
+  ].slice(-maxObs);
+  return {
+    ...s,
+    observations,
+    version: s.version + 1,
+  };
 }
 
 /**
@@ -39,36 +77,59 @@ interface AccumulateConfig {
  * distills the buffer into observations. Shared by `store` (assistant output) and
  * `onItemAppend` (user/tool input).
  */
-async function accumulate(
+function accumulate(
   s: ObservationalState,
   texts: string[],
   cfg: AccumulateConfig,
-): Promise<ObservationalState> {
+): ObservationalState {
+  const deferred = cfg.deferred;
+  const withReady = drainReady(s, deferred, cfg.maxObs);
   const newBuffer = [
-    ...s.buffer,
+    ...withReady.buffer,
     ...texts,
   ];
   const newTokens = texts.reduce((sum, t) => sum + estimateTokens(t), 0);
-  const totalBufferTokens = s.bufferTokens + newTokens;
+  const totalBufferTokens = withReady.bufferTokens + newTokens;
   if (totalBufferTokens >= cfg.threshold) {
-    const distilled = cfg.observer
-      ? await cfg.observer(newBuffer)
-      : [
-          `Processed ${newBuffer.length} items`,
-        ];
-    const newObservations = [
-      ...s.observations,
-      ...distilled,
-    ].slice(-cfg.maxObs);
+    if (cfg.observer) {
+      // Fire-and-collect: the observer runs off the turn path; its result
+      // joins `ready` and drains into observations on a later hook.
+      const run = Promise.resolve(cfg.observer(newBuffer)).then(
+        (distilled) => {
+          deferred.ready.push(distilled);
+          return distilled;
+        },
+        () => {
+          // A failed distillation drops its batch — same information loss as
+          // the old path's diagnostic-and-continue, without stalling a turn.
+          return [];
+        },
+      );
+      deferred.pending.push(run);
+      void run.finally(() => {
+        const i = deferred.pending.indexOf(run);
+        if (i !== -1) {
+          deferred.pending.splice(i, 1);
+        }
+      });
+      return {
+        ...withReady,
+        buffer: [],
+        bufferTokens: 0,
+      };
+    }
     return {
-      observations: newObservations,
+      observations: [
+        ...withReady.observations,
+        `Processed ${newBuffer.length} items`,
+      ].slice(-cfg.maxObs),
       buffer: [],
       bufferTokens: 0,
-      version: s.version + 1,
+      version: withReady.version + 1,
     };
   }
   return {
-    ...s,
+    ...withReady,
     buffer: newBuffer,
     bufferTokens: totalBufferTokens,
   };
@@ -116,22 +177,34 @@ export function observationalContext(config?: ObservationalContextConfig) {
   const maxObs = config?.maxObservations ?? DEFAULT_MAX_OBSERVATIONS;
   const threshold = config?.bufferThreshold ?? DEFAULT_BUFFER_THRESHOLD_TOKENS;
   const observer = config?.observer;
+  const scope = config?.scope ?? 'resource';
+  // One bucket per scope key: this layer instance is shared across every
+  // thread/resource on a harness, but its state is stored per scope.
+  const deferredByScope = new Map<string, DeferredDistill>();
+  const deferredFor = (ctx: ExecutionContext): DeferredDistill => {
+    const key = resolveScopeKey(scope, ctx);
+    let bucket = deferredByScope.get(key);
+    if (!bucket) {
+      bucket = {
+        pending: [],
+        ready: [],
+      };
+      deferredByScope.set(key, bucket);
+    }
+    return bucket;
+  };
 
   return {
     id: 'observational-context' as const,
     name: 'Observational Context',
     slot: Slot.OBSERVATIONS,
-    scope: config?.scope ?? 'resource',
+    scope,
     budget: {
       min: 500,
       max: 2_500,
     },
-    timeouts: {
-      store: 60_000,
-      // onItemAppend runs the same LLM-backed accumulate/distill path as
-      // store — it needs the same headroom, not the 5s pipeline default.
-      onItemAppend: 60_000,
-    },
+    // No LLM in the hook path any more — distillation is deferred, so the
+    // default hook timeouts are ample.
     hooks: {
       async init({ storage }) {
         const saved = await storage.get<ObservationalState>('state');
@@ -157,34 +230,48 @@ export function observationalContext(config?: ObservationalContextConfig) {
         };
       },
 
-      // Captures assistant output text.
-      async store({ newItems, state }) {
+      // Captures assistant output text. Also the drain point for background
+      // distillations: `store` runs every turn and its returned state is always
+      // persisted, so a completed batch lands without `recall` mutating state
+      // (which would force this layer out of the anchor band for that turn).
+      async store({ newItems, state, ctx }) {
         const s = state ?? emptyObservationalState();
         const texts = collectOutputText(newItems);
         return {
-          state: await accumulate(s, texts, {
+          state: accumulate(s, texts, {
             threshold,
             maxObs,
             observer,
+            deferred: deferredFor(ctx),
           }),
         };
       },
 
       // Captures user input and tool output text (pass-through; no transform).
-      async onItemAppend({ items, state }) {
+      async onItemAppend({ items, state, ctx }) {
         const s = state ?? emptyObservationalState();
         const texts = collectInputText(items);
+        const deferred = deferredFor(ctx);
         if (texts.length === 0) {
-          return {
-            items,
-          };
+          // Still fold in anything that finished, so a quiet append is not a
+          // missed drain opportunity.
+          const drained = drainReady(s, deferred, maxObs);
+          return drained === s
+            ? {
+                items,
+              }
+            : {
+                items,
+                state: drained,
+              };
         }
         return {
           items,
-          state: await accumulate(s, texts, {
+          state: accumulate(s, texts, {
             threshold,
             maxObs,
             observer,
+            deferred,
           }),
         };
       },
