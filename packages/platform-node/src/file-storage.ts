@@ -51,8 +51,55 @@ function decodeKey(encoded: string): string {
   return decodeURIComponent(encoded.replaceAll(ENCODED_SEP, '%')).replaceAll('_u', '_');
 }
 
+/**
+ * The pre-`_u`-escape encoder, preserved verbatim so files written by an
+ * earlier release stay readable. Any key containing `_` (or `%`) maps to a
+ * different filename under the current scheme, so a read miss retries here
+ * before reporting `null` — see `legacyFileFor`.
+ *
+ * @internal
+ */
+function legacyEncodeKey(key: string): string {
+  return encodeURIComponent(key).replace(/%/g, ENCODED_SEP);
+}
+
 function keyToPath(root: string, key: string): string {
   return path.join(root, `${encodeKey(key)}.json`);
+}
+
+/**
+ * Resolve the legacy on-disk filename for `key`, or `null` when no distinct
+ * legacy read is warranted.
+ *
+ * Two cases are excluded deliberately:
+ *
+ * 1. The encodings agree (no `_`/`%` in the key) — the canonical read already
+ *    covered that file, so a fallback would be a redundant `ENOENT`.
+ * 2. The legacy name is *also* the canonical name of some OTHER key. The
+ *    legacy scheme is not injective against the new one: key `plain_nderscore`
+ *    encodes canonically to `plain_underscore.json`, which is exactly the
+ *    legacy filename for key `plain_underscore`. Falling back there would let
+ *    `get('plain_underscore')` return a value that legitimately belongs to
+ *    `plain_nderscore`, turning a missing read into a cross-key data leak —
+ *    strictly worse than the `null` this fallback exists to avoid.
+ *
+ * @internal
+ */
+function legacyFileFor(root: string, key: string): string | null {
+  const legacy = legacyEncodeKey(key);
+  if (legacy === encodeKey(key)) {
+    return null;
+  }
+  let decoded: string | null = null;
+  try {
+    decoded = decodeKey(legacy);
+  } catch {
+    decoded = null;
+  }
+  if (decoded !== null && encodeKey(decoded) === legacy) {
+    return null;
+  }
+  return path.join(root, `${legacy}.json`);
 }
 
 function pathToKey(file: string): string | null {
@@ -130,21 +177,91 @@ export function createFileStorage(options: CreateFileStorageOptions = {}): Stora
     }
   }
 
-  async function readKey<T>(key: string): Promise<T | null> {
-    const file = keyToPath(root, key);
+  function parseRaw<T>(raw: string): T | null {
+    if (raw.length === 0) {
+      return null;
+    }
+    const parsed = JSON.parse(raw);
+    return typedCast<T>(parsed);
+  }
+
+  /**
+   * Read a file written under the pre-`_u`-escape encoding and fold it onto
+   * the canonical name so later reads take the fast path.
+   *
+   * Migration is best effort: this is a storage adapter, so a failed rename
+   * must not turn a successful read into a throw. On failure the legacy file
+   * stays put and the next read falls back again.
+   */
+  async function readLegacy<T>(key: string, legacy: string): Promise<T | null> {
+    let raw: string;
     try {
-      const raw = await readFile(file, 'utf8');
-      if (raw.length === 0) {
-        return null;
-      }
-      const parsed = JSON.parse(raw);
-      return typedCast<T>(parsed);
+      raw = await readFile(legacy, 'utf8');
     } catch (err) {
       if (isErrnoException(err) && err.code === 'ENOENT') {
         return null;
       }
-      console.warn(`createFileStorage: failed to read "${key}":`, err);
+      console.warn(`createFileStorage: failed to read legacy file for "${key}":`, err);
       return null;
+    }
+    let value: T | null;
+    try {
+      value = parseRaw<T>(raw);
+    } catch (err) {
+      console.warn(`createFileStorage: failed to parse legacy file for "${key}":`, err);
+      return null;
+    }
+    // The legacy name may not decode to `key` (a key containing `__` did not
+    // survive the old decoder at all), so the construction-time scan can have
+    // missed it. Advertise it now that a read proved it exists.
+    keyIndex.add(key);
+    try {
+      // `rename` publishes the canonical name and drops the legacy one in a
+      // single atomic step — no window where both or neither exists.
+      await rename(legacy, keyToPath(root, key));
+    } catch {
+      // Best effort; the value was read successfully and that is what matters.
+    }
+    return value;
+  }
+
+  async function readKey<T>(key: string): Promise<T | null> {
+    const file = keyToPath(root, key);
+    try {
+      const raw = await readFile(file, 'utf8');
+      return parseRaw<T>(raw);
+    } catch (err) {
+      if (!isErrnoException(err) || err.code !== 'ENOENT') {
+        console.warn(`createFileStorage: failed to read "${key}":`, err);
+        return null;
+      }
+    }
+    // Canonical name absent — the file may predate the `_u` escape pass.
+    const legacy = legacyFileFor(root, key);
+    if (legacy === null) {
+      return null;
+    }
+    return readLegacy<T>(key, legacy);
+  }
+
+  /**
+   * Drop a legacy-named file for `key`, best effort. Called on both `set` and
+   * `delete` so the legacy copy can never outlive the canonical one: without
+   * this, `delete(k)` then `set(k, v2)` then `delete(k)` would leave the
+   * legacy file behind for the fallback read to resurrect as a stale value.
+   */
+  async function removeLegacy(key: string): Promise<void> {
+    const legacy = legacyFileFor(root, key);
+    if (legacy === null) {
+      return;
+    }
+    try {
+      await unlink(legacy);
+    } catch (err) {
+      if (isErrnoException(err) && err.code === 'ENOENT') {
+        return;
+      }
+      console.warn(`createFileStorage: failed to remove legacy file for "${key}":`, err);
     }
   }
 
@@ -163,10 +280,16 @@ export function createFileStorage(options: CreateFileStorageOptions = {}): Stora
       await writeFile(tmp, JSON.stringify(value));
       await rename(tmp, file);
       keyIndex.add(key);
+      // Retire any legacy-named copy: the canonical file now holds the truth,
+      // and leaving the old one would give a later fallback read something
+      // stale to resurrect after a delete.
+      await removeLegacy(key);
     },
     async delete(key: string): Promise<void> {
       const file = keyToPath(root, key);
       keyIndex.delete(key);
+      // Both names, or the fallback read would revive the legacy value.
+      await removeLegacy(key);
       try {
         await unlink(file);
       } catch (err) {
