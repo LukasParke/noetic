@@ -375,7 +375,7 @@ export async function executeToolCall(params: ExecuteToolCallParams): Promise<{
   // schema BEFORE anything runs. This is the single point where untrusted
   // model output crosses into user code; a structured validation error back
   // to the model beats a tool throwing halfway through side effects — models
-  // self-correct on good error messages. The programmatic `call-tool` path
+  // self-correct on good error messages. The programmatic `tool` step path
   // (`executeTool`) has always validated here; this closes the asymmetry.
   const parsed = matchedTool.input.safeParse(params.args);
   if (!parsed.success) {

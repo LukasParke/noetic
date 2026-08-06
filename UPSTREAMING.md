@@ -7,11 +7,14 @@ ported — everything here speaks current Noetic vocabulary (`ContextLayer`,
 `@noetic-tools/context`, `noetic:*` item types) and sits on top of the
 memory→context rename and the banded-assembly/cache-anchoring work.
 
-Every commit says which fork commit(s) it came from. Every behavioral fix
-carries tests; where the port deviated from the fork's diff, the deviation was
-deliberate and is listed below. All suites green: **2,150+ pass / 0 fail**
-across the workspace (baseline at `ead54108`: 2003 pass / 3 fail, plus 2
-typecheck errors in core tests).
+Every ported commit cites its fork origin; commits without a fork origin — the
+notes file itself, the inspector glyph fix (`928d63c3`, new work for an
+upstream-only package the fork does not have), and the post-port review-round
+fixes — say so in their own bodies. Every behavioral fix carries tests; where
+the port deviated from the fork's diff, the deviation was deliberate and is
+listed below. All suites green: **2,150+ pass / 0 fail** across the workspace
+(baseline at `ead54108`: 2003 pass / 3 fail, plus 2 typecheck errors in core
+tests).
 
 ## Part 1 — Fixes and hardening (recommend reviewing in order)
 
@@ -23,7 +26,7 @@ typecheck errors in core tests).
 | eval optimizer | write-back could destroy uncommitted work (now a version-control guard, `--force-dirty` to override); cases ran serially (now bounded pool + `--concurrency`); judge harness rebuilt per score call; GEPA scope never reached discovery; tool candidate paths keyed by (mutable) name; dead `budget` knob removed; `walkStep` missed `provide`/`every` composites | `d83a27b7`, `2273baa1` |
 | openui hardening | any client could `set` any key at any size (now declared-$var check + 16 KiB cap); concurrent prompts interleaved streams (409 while active); client disconnect leaked the stream; one client's replay dropped another's events (per-client watermarks); multi-thread mirrors were last-writer-wins (thread-keyed `readState`) | `b4b1d6ee` |
 | doom-loop guard | a model stuck on the same tool call burned all 32 rounds; now trips after 4 identical rounds with a `doom_loop_detected` event | `ac816771` |
-| tool-arg validation | model-provided tool args were **never validated** against the declared Zod schema — raw `JSON.parse` output went straight into user tool code. The programmatic `call-tool` path always validated; this closes the asymmetry (and makes chat-sdk's "validated at runtime by the harness" comment true). Plus: the tool resolved for the span is reused instead of a second linear scan per call | `0f27cd46` (validation + lookup halves) |
+| tool-arg validation | model-provided tool args were **never validated** against the declared Zod schema — raw `JSON.parse` output went straight into user tool code. The programmatic `tool` step path (`executeTool`) always validated; this closes the asymmetry (and makes chat-sdk's "validated at runtime by the harness" comment true). Plus: the tool resolved for the span is reused instead of a second linear scan per call | `0f27cd46` (validation + lookup halves) |
 | perf: distillation/memoization | observational distillation no longer blocks the append pipeline (fire-and-collect, per-scope buckets); file-reference LLM scoring is now **opt-in** (see behavior changes); unified tool pool memoized per harness; per-`Tool` SDK conversion cached (byte-stable tools segment for provider prompt caches) | `dea4da45` |
 | channel reaping + loop/park | every `channel()` minted state that lived for the harness lifetime — per-delegation channels leaked unboundedly (reap predicate re-derived to respect external channels and stream cursors); loop snapshots re-spread history per iteration; park jitter now deterministic; storage-less in-memory dispatch skips the handle round-trip | `4c62520a` |
 | durable checkpoints | every snapshot inlined the full transcript — O(n²) write volume per session (~60x reduction measured). Items now persist as thread-keyed idempotent batches; restore stitches with one batched read and clamps the watermark (a partial store can't silently truncate); watermarks are per-harness (module state would cross-contaminate); failed turns roll back durably; step-ledger gap accounting survives storage outage bursts | `5f0a8054` + `22f8cfa9` + `5fc11f62`, folded to final shape |
@@ -35,19 +38,49 @@ typecheck errors in core tests).
 
 ## Part 2 — Proposal: native multi-agent patterns (separate discussion)
 
-Two commits, deliberately last and cleanly revertable:
+Two commits, deliberately last in the review order:
 
 1. **`defineAgent` / `asTool` / `handoff` / `quorum` / `teammate`** — a
    compositional multi-agent layer built entirely on existing primitives.
    One new pattern module + barrel exports; zero interpreter/runtime/Step
-   changes. (fork `fa8a9d24`)
+   changes. (`4cccf95d`, fork `fa8a9d24`)
 2. **Declarative agent workflow nodes** — `agent-tool` / `handoff` / `quorum`
    JSON node kinds, plus a `HydrationContext.nodeHydrators` extension seam so
    the hydrators live in `patterns/` and `builders/` stays ignorant of them.
-   The seam is generally useful for any out-of-layer node kind. (fork
-   `f063cc87`, rearchitected onto the seam)
+   The seam is generally useful for any out-of-layer node kind. (`77cb290d`,
+   fork `f063cc87`, rearchitected onto the seam)
 
-If only one lands, take the first — it's self-contained.
+### Dropping the tranche
+
+The tranche is **not** a clean `git revert` of those two commits on its own —
+two later commits reach back into it, so the revert must include them:
+
+- `928d63c3` (inspector glyphs) adds the `'agent-tool'`/`handoff`/`quorum`
+  entries to `GLYPHS: Record<GraphNodeKind, string>`. `GraphNodeKind` is
+  derived from `WorkflowNode['kind']`, so reverting the node kinds without
+  this commit leaves the inspector red (TS2739, three keys with no kinds).
+- `efc2b689` (the `ContextInput` row in the Part 1 table) modifies
+  `packages/core/src/patterns/agents.ts` — a file `4cccf95d` created. Its
+  revert therefore hits `CONFLICT (modify/delete)` on that path.
+
+To drop the tranche, revert all three together and resolve the one conflict by
+deleting the file:
+
+```sh
+git revert --no-commit 928d63c3 77cb290d 4cccf95d
+git rm --force packages/core/src/patterns/agents.ts   # resolves the modify/delete
+git commit
+```
+
+Verified: with that resolution the tree has no remaining conflicts and both
+`packages/core` and `packages/inspector` typecheck clean. Nothing outside the
+tranche imports `patterns/agents`, so deleting it is the whole resolution — the
+`efc2b689` hunk on that file was only the `ContextConfig | ContextLayer[]` →
+`ContextInput` rename, and the rest of `efc2b689` (the actual `ContextInput`
+fix) survives the revert intact.
+
+If only one of the two lands, take the first — it is self-contained apart from
+the barrel exports.
 
 ## Deliberate behavior changes (flagging so nobody finds them the hard way)
 
@@ -95,10 +128,29 @@ If only one lands, take the first — it's self-contained.
 
 ## Notes for reviewers
 
-- The doom-loop throw is a plain `Error` — a `loop().onError` cannot recover
-  it (none of the 13 error kinds fits; adding one is a follow-up decision).
-  The `doom_loop_detected` event and `context_pressure` event are also not
+- The doom-loop guard's throw shape and its recovery story are covered in the
+  post-port review round below (the guard is result-aware and its threshold is
+  configurable). The `doom_loop_detected` and `context_pressure` events are not
   yet in the runtime.mdx event table (docs not touched in this port).
+- **`loop()` snapshot `history` is frozen at runtime but still typed
+  `unknown[]`.** `executeLoop` builds one `Object.freeze([...history])` per
+  iteration and shares it with the snapshot, replacing a per-verdict spread
+  copy. In-place mutation of `snapshot.history` was never a supported
+  operation — nothing in the runtime reads mutations back — but code that did
+  it used to silently no-op and now throws a `TypeError` from inside the
+  `until` predicate. Narrowing `Snapshot.history` to `ReadonlyArray<unknown>`
+  is the honest type and a candidate follow-up; it is a semver-major on
+  `@noetic-tools/types`, so it was left out of a port branch.
+- **Workflow tool nodes surface tool failures as `WORKFLOW_TOOL_CALL_FAILED`
+  config errors.** Routing JSON tool nodes through `executeToolCall` (for arg
+  validation, steering, and tool-UI) means a throwing tool is caught there and
+  reduced to an error string, which `hydrateToolNode` wraps in a
+  `NoeticConfigError`. A typed `NoeticError`'s `detail.kind` therefore does not
+  survive the boundary — it is stringified into the message. Kind-based retry
+  or `onError` policies around a JSON workflow should gate on the failing node
+  rather than the error kind. This is a known tradeoff of routing through
+  `executeToolCall`; threading the original `cause` back out is the follow-up
+  that would restore kind-based recovery.
 - Compaction folding happens on the model-request paths; `prepareBandedView`
   and cache-anchoring see unfolded history. Correct today (they operate on
   layer output, not the history band) — but if anchoring ever keys an epoch
@@ -109,7 +161,45 @@ If only one lands, take the first — it's self-contained.
   of the same class. The fork later resolved this by reclassifying the
   hydrator as a compiler in `patterns/`; that refactor is worth doing here
   too but was out of scope for a port.
-- Spec/docs sync (this repo's rule) was intentionally out of scope: specs
-  23/23a (checkpoint boundaries, frontier), 26 (matchMode, new node kinds),
-  11/12 (compaction, allocator), and the runtime.mdx event table all need a
-  follow-up pass before release.
+- Spec/docs sync (this repo's rule) was largely out of scope: specs 23/23a
+  (checkpoint boundaries, frontier), 26 (matchMode, new node kinds), 11/12
+  (compaction, allocator), `04-spawn`'s and `08-runtime`'s `context?:
+  ContextLayer[]` signatures, and the runtime.mdx event table all still need a
+  follow-up pass before release. The two exceptions, both fixed in the review
+  round below because they published a signature that does not compile:
+  `operators/spawn.mdx`, `operators/provide.mdx`, and the `spawn` line of
+  `specs/01-step-type.md` now say `ContextInput`.
+
+## Post-port review round
+
+An adversarial review of this branch found fifteen issues; the confirmed ones
+are fixed here, each with a regression test proved red against the unfixed
+code. These commits have no fork origin — they are fixes to the port itself:
+
+- **session-log item-schema registry** — the session-owned `ItemLog` was bound
+  to the base registry, so it rejected every layer- and tool-declared item type.
+- **checkpoint item batches: stale-batch stitching + rollback sweep** — a
+  shorter batch never superseded a longer stale one at the same offset, and
+  rolled-back batches could resurrect on restore when checkpoint cadence
+  differed between turns. Stitching is now gap-aware and rollback sweeps
+  superseded batches (`truncateItems`).
+- **warm layer hydration keys on scope** — the warm pointer keyed on `threadId`
+  alone, leaking `resource`- and `global`-scoped layer state across scope
+  boundaries; the key now carries each layer's resolved scope key.
+- **compaction fold index space** — the fold was applied to a system-stripped
+  array while `replacesUntil` indexed the unstripped one, silently deleting
+  live turns. Folding now happens before partitioning.
+- **doom-loop guard** — the fingerprint is result-aware (a progressing poll
+  breaks the streak) and the threshold is configurable.
+- **file-storage legacy-key migration** — the new `_u`-escaping encoder orphaned
+  every existing on-disk key containing `_`; reads now fall back to the legacy
+  filename.
+- **allocator minimums guarantee** — declared mins are satisfied against the
+  full available window and only the discretionary remainder is rationed by
+  `LAYER_POOL_SHARE`, restoring spec 11's "minimums first" normative claim.
+- **`context_pressure` latch** — the once-per-step latch was set on
+  non-emitting paths too, so a first assembly below the threshold permanently
+  suppressed the event for that step.
+- **vocabulary and docs accuracy** — this file, plus one fork Step-kind name
+  that survived in the tool-arg validation comment (it now names the `tool`
+  step and `executeTool`) and the `ContextInput` doc/spec signatures above.
