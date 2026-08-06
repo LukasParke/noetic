@@ -70,14 +70,26 @@ export interface CheckpointHarnessHandle {
  * `rollback` is the failed-turn seam: the session runner truncates the shared
  * session log back to the turn watermark, and any batch persisted mid-turn now
  * describes items the live log no longer has. The watermark must come back
- * with it — and the stale over-watermark batch must be superseded — or every
- * subsequent checkpoint would diff against a durable log that is ahead of the
- * live one (writing nothing while restore resurrects the rolled-back items).
+ * with it — and the stale over-watermark batches must be DELETED, not merely
+ * hidden — or every subsequent checkpoint would diff against a durable log that
+ * is ahead of the live one (writing nothing while restore resurrects the
+ * rolled-back items).
  *
  * @internal
  */
 export class ItemLogPersistence {
   private readonly counts = new Map<string, number>();
+  /**
+   * Owners whose durable batches are known to hold rolled-back items, and the
+   * lowest offset from which they do. Recorded by `rollback` and consumed by
+   * the owner's NEXT `captureCheckpoint`, which deletes the batches before
+   * appending. Deferred rather than done inside `rollback` because `rollback`
+   * is a synchronous seam on the abort path (the session runner calls it from
+   * `rollbackTurn`) and must not await storage there; the batches are
+   * unreachable in the meantime anyway, since the clamped watermark bounds
+   * every `persistedCount` written between the rollback and the cleanup.
+   */
+  private readonly dirtyFrom = new Map<string, number>();
 
   get(ownerKey: string): number {
     return this.counts.get(ownerKey) ?? 0;
@@ -89,22 +101,46 @@ export class ItemLogPersistence {
 
   /**
    * A turn rolled the live log back to `length`. Clamp the watermark so the
-   * next checkpoint re-persists from the truncation point. The store's batch
-   * keys embed the offset, so the catch-up batch overwrites the stale one at
-   * the same offset; `loadItems` honours `persistedCount` from the snapshot,
-   * which is written from this clamped value, so a residual tail batch past
-   * the clamp is never stitched back in.
+   * next checkpoint re-persists from the truncation point, and mark the owner
+   * dirty from `length` so that checkpoint also DELETES the batches the
+   * truncation orphaned.
+   *
+   * Clamping alone is not enough. It only makes the stale batches unreachable
+   * while this process's watermark stays clamped: `loadItems` reads whatever is
+   * under the prefix, so as soon as the recovery turn's batch boundaries differ
+   * from the aborted turn's — and they do, because checkpoints fire per
+   * completed step and step boundaries move with the work — a stale batch
+   * survives at an offset no recovery batch covers and gets stitched back in.
    */
   rollback(ownerKey: string, length: number): void {
     const current = this.counts.get(ownerKey);
-    if (current !== undefined && current > length) {
-      this.counts.set(ownerKey, length);
+    if (current === undefined || current <= length) {
+      return;
     }
+    this.counts.set(ownerKey, length);
+    const existing = this.dirtyFrom.get(ownerKey);
+    // Lowest wins: two rollbacks before the next checkpoint must clean from the
+    // earlier point, or the window between them stays orphaned.
+    this.dirtyFrom.set(ownerKey, existing === undefined ? length : Math.min(existing, length));
+  }
+
+  /**
+   * Offset from which this owner's durable batches are stale, or `undefined`
+   * when nothing was rolled back since the last cleanup.
+   */
+  dirtyOffset(ownerKey: string): number | undefined {
+    return this.dirtyFrom.get(ownerKey);
+  }
+
+  /** The pending cleanup for `ownerKey` has been carried out. */
+  clearDirty(ownerKey: string): void {
+    this.dirtyFrom.delete(ownerKey);
   }
 
   /** Drop an owner's watermark (session teardown). */
   delete(ownerKey: string): void {
     this.counts.delete(ownerKey);
+    this.dirtyFrom.delete(ownerKey);
   }
 }
 
@@ -124,6 +160,44 @@ export class ItemLogPersistence {
  */
 export function itemLogOwnerKey(owner: { threadId?: string; id: string }): string {
   return owner.threadId ? `thread:${owner.threadId}` : `execution:${owner.id}`;
+}
+
+/**
+ * Carry out the deferred cleanup a `rollback` recorded: delete every durable
+ * batch for `ownerKey` at or past the rolled-back watermark, so this
+ * checkpoint's catch-up batch is the ONLY thing describing items from that
+ * offset on. One `list` per rollback, never per checkpoint — the dirty flag is
+ * only set by `rollback` and is cleared here.
+ *
+ * A failure leaves the flag set so the next checkpoint retries, and keeps the
+ * clamped watermark: `persistedCount` still bounds `loadItems` to the clean
+ * prefix, so the worst case is the pre-fix behaviour rather than a lost turn.
+ */
+async function discardRolledBackBatches(
+  h: CheckpointHarnessHandle,
+  store: CheckpointStore,
+  ownerKey: string,
+): Promise<void> {
+  const dirtyFrom = h.itemLogPersistence.dirtyOffset(ownerKey);
+  if (dirtyFrom === undefined) {
+    return;
+  }
+  if (!store.truncateItems) {
+    // A third-party store predating `truncateItems` cannot be cleaned. Drop the
+    // flag rather than listing on every future checkpoint for an owner whose
+    // store will never honour it.
+    h.itemLogPersistence.clearDirty(ownerKey);
+    return;
+  }
+  try {
+    await store.truncateItems(ownerKey, dirtyFrom);
+    h.itemLogPersistence.clearDirty(ownerKey);
+  } catch (err) {
+    console.warn(
+      `AgentHarness.checkpoint: failed to discard rolled-back item batches for "${ownerKey}":`,
+      err,
+    );
+  }
 }
 
 /**
@@ -166,6 +240,7 @@ export async function captureCheckpoint(h: CheckpointHarnessHandle, ctx: Context
   // as the transcript grows (previously O(n²) over a session).
   const allItems = ctx.itemLog.items;
   const ownerKey = itemLogOwnerKey(ctx);
+  await discardRolledBackBatches(h, store, ownerKey);
   const already = h.itemLogPersistence.get(ownerKey);
   if (allItems.length > already && store.appendItems) {
     const batch = allItems.slice(already);

@@ -65,8 +65,32 @@ export interface CheckpointStore {
    * behaviour from it.
    */
   appendItems?(ownerKey: string, offset: number, items: unknown[]): Promise<void>;
-  /** Load and stitch persisted item batches, returning the first `count` items in order. */
+  /**
+   * Load and stitch persisted item batches, returning the first `count` items
+   * in order.
+   *
+   * Stitching is CONTINUITY-CHECKED: batches are read in offset order and a
+   * batch is accepted only when its start offset equals the number of items
+   * stitched so far. The first discontinuity — a gap (a deleted or never-written
+   * batch) or an overlap (a stale longer batch left behind by a shorter
+   * superseding write) — ends the stitch. Callers get a short, genuinely
+   * contiguous PREFIX rather than a silently reordered log, which is what the
+   * `Math.min(persistedCount, …)` watermark clamp in `restore` assumes.
+   */
   loadItems?(ownerKey: string, count: number): Promise<unknown[]>;
+  /**
+   * Drop every persisted item batch for `ownerKey` whose start offset is `>=`
+   * `offset`. The failed-turn seam: a rolled-back turn's mid-turn batches
+   * describe items the live log no longer has, and clamping the in-memory
+   * watermark alone leaves them on disk to be stitched back by a later restore
+   * whenever the recovery turn's batch boundaries don't land identically.
+   *
+   * Only whole batches are removed. A batch that STRADDLES `offset` (starts
+   * before it, extends past it) is left in place: the next `appendItems` for
+   * this owner writes at the clamped offset, superseding it at its own key, and
+   * the continuity check in `loadItems` rejects whatever tail remains.
+   */
+  truncateItems?(ownerKey: string, offset: number): Promise<void>;
   /** List every `executionId` that has a persisted snapshot. */
   list(): Promise<
     ReadonlyArray<{
@@ -103,6 +127,24 @@ function itemBatchPrefix(ownerKey: string): string {
 /** Zero-padded so lexicographic key order matches item order under `list()`. */
 function itemBatchKey(ownerKey: string, offset: number): string {
   return `${itemBatchPrefix(ownerKey)}${String(offset).padStart(8, '0')}`;
+}
+
+/**
+ * Recover the start offset a batch key encodes, or `null` when the suffix is
+ * not one of ours. Stitching depends on the offset being TRUSTWORTHY, so an
+ * unparseable suffix must be skipped rather than coerced to `NaN`/`0` — either
+ * would fake a continuity match at the head of the log.
+ */
+function itemBatchOffset(ownerKey: string, key: string): number | null {
+  const prefix = itemBatchPrefix(ownerKey);
+  if (!key.startsWith(prefix)) {
+    return null;
+  }
+  const suffix = key.slice(prefix.length);
+  if (suffix.length === 0 || !/^\d+$/.test(suffix)) {
+    return null;
+  }
+  return Number(suffix);
 }
 
 function executionIdFromSnapshotKey(key: string): string | null {
@@ -191,15 +233,68 @@ export function createCheckpointStore(options: CreateCheckpointStoreOptions): Ch
     const batches = await storageGetMany<unknown[]>(storage, keys);
     const out: unknown[] = [];
     for (const key of keys) {
-      const batch = batches.get(key);
-      if (batch) {
-        out.push(...batch);
+      /* CONTINUITY, not blind concat. A batch is only the continuation of what
+       * we have when its start offset IS what we have. Two ways that fails, both
+       * of which used to corrupt the stitch silently:
+       *   - overlap  (offset < out.length): a stale LONGER batch from a discarded
+       *     history whose tail outlives the shorter batch that superseded its
+       *     head. Concatenating it appends discarded items after the good ones.
+       *   - gap      (offset > out.length): a missing leading/middle batch. Concat
+       *     welds the two sides together and re-positions later items at indices
+       *     they never occupied.
+       * Either way, stop: everything already stitched is a true prefix, and the
+       * short return is what `restore`'s watermark clamp is built to handle. */
+      const offset = itemBatchOffset(ownerKey, key);
+      if (offset === null || offset !== out.length) {
+        break;
       }
+      const batch = batches.get(key);
+      if (!batch) {
+        break;
+      }
+      out.push(...batch);
       if (out.length >= count) {
         break;
       }
     }
     return out.slice(0, count);
+  }
+
+  async function truncateItems(ownerKey: string, offset: number): Promise<void> {
+    const keyed: Array<{
+      key: string;
+      offset: number;
+    }> = [];
+    for (const key of await storage.list(itemBatchPrefix(ownerKey))) {
+      const batchOffset = itemBatchOffset(ownerKey, key);
+      if (batchOffset === null) {
+        continue;
+      }
+      keyed.push({
+        key,
+        offset: batchOffset,
+      });
+    }
+    keyed.sort((a, b) => a.offset - b.offset);
+    /* Whole batches at or past the cut go. The one batch that can STRADDLE the
+     * cut — the highest one starting before it, when its items run past it — is
+     * rewritten rather than kept whole: its tail is rolled-back items, and
+     * leaving them would make the durable prefix longer than the cut, which
+     * `loadItems`' continuity check would then honour as the real log. */
+    const straddleCandidate = keyed.filter((entry) => entry.offset < offset).pop();
+    for (const entry of keyed) {
+      if (entry.offset >= offset) {
+        await storage.delete(entry.key);
+      }
+    }
+    if (!straddleCandidate) {
+      return;
+    }
+    const batch = await storage.get<unknown[]>(straddleCandidate.key);
+    if (!batch || straddleCandidate.offset + batch.length <= offset) {
+      return;
+    }
+    await storage.set(straddleCandidate.key, batch.slice(0, offset - straddleCandidate.offset));
   }
 
   /**
@@ -224,6 +319,7 @@ export function createCheckpointStore(options: CreateCheckpointStoreOptions): Ch
     load,
     appendItems,
     loadItems,
+    truncateItems,
     list,
     clear,
   };
