@@ -110,7 +110,9 @@ function functionCallResponse(callNumber: number): MockModelResponse {
         type: 'function_call',
         callId,
         name: 'noop',
-        arguments: '{}',
+        // Varied per round: this fixture exercises the tool-round LIMIT path;
+        // identical arguments would (correctly) trip the doom-loop guard first.
+        arguments: `{"step":${callNumber}}`,
       },
     ],
     usage: {
@@ -350,6 +352,159 @@ describe('AgentHarness session accessors', () => {
     expect(collected.some((item) => item.type === 'message' && item.role === 'user')).toBe(true);
     expect(
       collected.some((item) => item.type === 'function_call_output' && item.callId === 'call-noop'),
+    ).toBe(true);
+  });
+
+  it('throws a structured doom-loop error on repeated identical tool rounds', async () => {
+    class StuckClient {
+      calls = 0;
+      callModel(): {
+        getFullResponsesStream: () => AsyncIterable<unknown>;
+        getResponse: () => Promise<MockModelResponse>;
+      } {
+        const callNumber = this.calls++;
+        return {
+          async *getFullResponsesStream() {},
+          getResponse: async () =>
+            frameworkCast<MockModelResponse>({
+              id: `resp-${callNumber}`,
+              status: 'completed',
+              output: [
+                {
+                  id: `fc-${callNumber}`,
+                  status: 'completed',
+                  type: 'function_call',
+                  callId: `call_${callNumber}`,
+                  name: 'noop',
+                  arguments: '{}', // identical every round — a stuck model
+                },
+              ],
+              usage: {
+                inputTokens: 1,
+                outputTokens: 1,
+              },
+            }),
+        };
+      }
+    }
+    const fakeClient = new StuckClient();
+    const noopTool = tool({
+      name: 'noop',
+      description: 'Always returns ok',
+      input: z.object({}),
+      output: z.object({
+        ok: z.boolean(),
+      }),
+      execute: async () => ({
+        ok: true,
+      }),
+    });
+    const harness = new AgentHarness({
+      name: 'test',
+      params: {},
+    });
+    frameworkCast<{
+      client: StuckClient;
+    }>(harness).client = fakeClient;
+    const ctx = harness.createContext();
+
+    await expect(
+      harness.callModel({
+        model: 'test/model',
+        items: [
+          makeMessage('user', 'go'),
+        ],
+        tools: [
+          noopTool,
+        ],
+        ctx,
+      }),
+    ).rejects.toThrow('Doom loop detected');
+    // Guard trips after 4 identical rounds (1 + DOOM_LOOP_IDENTICAL_ROUNDS),
+    // not after the 32-round limit.
+    expect(fakeClient.calls).toBeLessThan(10);
+  });
+
+  it('does not trip the doom-loop guard when only a nested argument value differs', async () => {
+    // The fingerprint canonicalizes arguments by sorting keys at EVERY depth. A
+    // top-level-only key allowlist would collapse `{"filter":{"page":N}}` to
+    // `{"filter":{}}` for all N and abort this healthy run.
+    class NestedArgsClient {
+      calls = 0;
+      callModel(): {
+        getFullResponsesStream: () => AsyncIterable<unknown>;
+        getResponse: () => Promise<MockModelResponse>;
+      } {
+        const callNumber = this.calls++;
+        return {
+          async *getFullResponsesStream() {},
+          getResponse: async () => {
+            if (callNumber >= 6) {
+              return messageResponse(`resp-final-${callNumber}`, 'done');
+            }
+            return frameworkCast<MockModelResponse>({
+              id: `resp-${callNumber}`,
+              status: 'completed',
+              output: [
+                {
+                  id: `fc-${callNumber}`,
+                  status: 'completed',
+                  type: 'function_call',
+                  callId: `call_${callNumber}`,
+                  name: 'search',
+                  arguments: `{"filter":{"page":${callNumber},"kind":"doc"}}`,
+                },
+              ],
+              usage: {
+                inputTokens: 1,
+                outputTokens: 1,
+              },
+            });
+          },
+        };
+      }
+    }
+    const fakeClient = new NestedArgsClient();
+    const searchTool = tool({
+      name: 'search',
+      description: 'Paginated search',
+      input: z.object({
+        filter: z.object({
+          page: z.number(),
+          kind: z.string(),
+        }),
+      }),
+      output: z.object({
+        ok: z.boolean(),
+      }),
+      execute: async () => ({
+        ok: true,
+      }),
+    });
+    const harness = new AgentHarness({
+      name: 'test',
+      params: {},
+    });
+    frameworkCast<{
+      client: NestedArgsClient;
+    }>(harness).client = fakeClient;
+    const ctx = harness.createContext();
+
+    const response = await harness.callModel({
+      model: 'test/model',
+      items: [
+        makeMessage('user', 'go'),
+      ],
+      tools: [
+        searchTool,
+      ],
+      ctx,
+    });
+
+    // Six distinct tool rounds ran to completion, then the final message.
+    expect(fakeClient.calls).toBe(7);
+    expect(
+      response.items.some((item) => item.type === 'message' && item.role === 'assistant'),
     ).toBe(true);
   });
 

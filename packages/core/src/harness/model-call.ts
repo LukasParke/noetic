@@ -34,6 +34,56 @@ import type { MessageQueue, QueuedMessage } from '../runtime/message-queue';
 import { buildItemSchemaRegistry, createToolResultItem } from './model-schema.js';
 
 const MAX_TOOL_ROUNDS = 32;
+/** Consecutive identical tool-call rounds (beyond the first) that trip the doom-loop guard. */
+const DOOM_LOOP_IDENTICAL_ROUNDS = 3;
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Sort object keys at every depth. Array order is semantic and is preserved. */
+function sortKeysDeep(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(sortKeysDeep);
+  }
+  if (!isPlainRecord(value)) {
+    return value;
+  }
+  const sorted: Record<string, unknown> = {};
+  for (const key of Object.keys(value).sort()) {
+    sorted[key] = sortKeysDeep(value[key]);
+  }
+  return sorted;
+}
+
+/** Canonicalize a JSON arguments string (keys sorted at every depth) so cosmetic
+ *  key-order differences don't defeat the doom-loop fingerprint. Falls back to the
+ *  raw string for non-JSON and scalar arguments. */
+function canonicalizeArgs(raw: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return raw;
+  }
+  if (!isPlainRecord(parsed) && !Array.isArray(parsed)) {
+    return raw;
+  }
+  return JSON.stringify(sortKeysDeep(parsed));
+}
+
+/** Fingerprint a round's tool calls: name + canonical args, order-insensitive. */
+function fingerprintToolCalls(
+  calls: ReadonlyArray<{
+    name: string;
+    arguments: string;
+  }>,
+): string {
+  return calls
+    .map((fc) => `${fc.name}(${canonicalizeArgs(fc.arguments)})`)
+    .sort()
+    .join('|');
+}
 const MAX_RECOVERY_CONTINUATIONS = 3;
 const EPHEMERAL_CONTINUE_INPUT = 'continue';
 
@@ -521,6 +571,12 @@ export class AgentHarnessModelCaller {
     let invalidRecoveryContinuations = 0;
     let toolLimitRecoveryContinuations = 0;
     let useEphemeralContinue = false;
+    // Doom-loop guard: fingerprint each round's tool calls (name + canonical
+    // args). N identical consecutive rounds means the model is stuck; fail fast
+    // instead of burning the remaining MAX_TOOL_ROUNDS on the same dead end.
+    // State is per-call, so it never leaks across turns.
+    let lastToolFingerprint = '';
+    let identicalToolRounds = 0;
 
     while (!request.signal?.aborted) {
       const recoveryContinuation = useEphemeralContinue;
@@ -674,6 +730,19 @@ export class AgentHarnessModelCaller {
       const functionCalls = roundItems.filter(isFunctionCall);
       if (functionCalls.length === 0 || !request.tools) {
         break;
+      }
+      const fingerprint = fingerprintToolCalls(functionCalls);
+      identicalToolRounds = fingerprint === lastToolFingerprint ? identicalToolRounds + 1 : 0;
+      lastToolFingerprint = fingerprint;
+      if (identicalToolRounds >= DOOM_LOOP_IDENTICAL_ROUNDS) {
+        prepared.emitIfAllowed('doom_loop_detected', {
+          round,
+          fingerprint,
+          identicalRounds: identicalToolRounds + 1,
+        });
+        throw new Error(
+          `Doom loop detected: ${identicalToolRounds + 1} consecutive rounds of identical tool calls (${functionCalls.map((fc) => fc.name).join(', ')}).`,
+        );
       }
       await this.executeToolRound({
         functionCalls,
