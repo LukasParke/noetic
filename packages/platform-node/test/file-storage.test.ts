@@ -91,3 +91,62 @@ describe('createFileStorage', () => {
     expect(await storage.get<string>('k')).toBe('v');
   });
 });
+
+describe('key encoding round-trips (P6)', () => {
+  it('keys containing double underscores survive set → list → get', async () => {
+    const storage = createFileStorage({
+      root,
+    });
+    // The old scheme decoded '__' back into '%' and threw, making the key
+    // invisible to list() while get() still found it.
+    const nasty = [
+      'thread:__default__:itemLog:00000001',
+      'a__b',
+      'a_ub',
+      'plain_underscore',
+      'execution:abc:ledger:00000001',
+    ];
+    for (const key of nasty) {
+      await storage.set(key, {
+        key,
+      });
+    }
+    const listed = await storage.list('');
+    for (const key of nasty) {
+      expect(listed).toContain(key);
+      expect(
+        await storage.get<{
+          key: string;
+        }>(key),
+      ).toEqual({
+        key,
+      });
+    }
+  });
+
+  it('list is served from the index and stays correct across delete', async () => {
+    const storage = createFileStorage({
+      root,
+    });
+    await storage.set('p:1', 1);
+    await storage.set('p:2', 2);
+    await storage.delete('p:1');
+    expect(await storage.list('p:')).toEqual([
+      'p:2',
+    ]);
+  });
+
+  it('a fresh adapter over an existing root seeds its index from disk', async () => {
+    const first = createFileStorage({
+      root,
+    });
+    await first.set('seeded:key__with__underscores', 42);
+    const second = createFileStorage({
+      root,
+    });
+    expect(await second.list('seeded:')).toEqual([
+      'seeded:key__with__underscores',
+    ]);
+    expect(await second.get<number>('seeded:key__with__underscores')).toBe(42);
+  });
+});

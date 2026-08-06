@@ -1,12 +1,5 @@
-import {
-  existsSync,
-  mkdirSync,
-  readdirSync,
-  readFileSync,
-  renameSync,
-  unlinkSync,
-  writeFileSync,
-} from 'node:fs';
+import { existsSync, mkdirSync, readdirSync } from 'node:fs';
+import { readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { StorageAdapter } from '@noetic-tools/core';
 
@@ -22,6 +15,16 @@ function typedCast<T>(value: unknown): T {
   return value;
 }
 
+/**
+ * Narrow a caught value to a Node errno error. The async fs calls below
+ * replaced pre-flight `existsSync` checks — checking existence and then
+ * reading is a TOCTOU race once the read is awaited, so a missing file is
+ * detected from `ENOENT` on the operation itself.
+ */
+function isErrnoException(err: unknown): err is NodeJS.ErrnoException {
+  return typeof err === 'object' && err !== null && 'code' in err;
+}
+
 //#region Key <-> path mapping
 
 /**
@@ -30,18 +33,22 @@ function typedCast<T>(value: unknown): T {
  * `execution:<uuid>:frontier` round-trip to a single filename and back
  * without collisions.
  *
+ * Encoding is two-phase and unambiguous: first every literal underscore is
+ * escaped (`_` → `_u`), then URI-encoding escapes the rest, then `%` becomes
+ * `__`. The old single-phase scheme collapsed a key that legitimately
+ * contained `__` into a `%` on decode — `decodeKey('a__b')` threw and the
+ * key silently vanished from `list()` while `get()` still found it.
+ *
  * @internal
  */
 const ENCODED_SEP = '__';
 
 function encodeKey(key: string): string {
-  // URI-encode to escape non-filesystem-safe chars, then replace "%" with
-  // double-underscore so a decoded path still survives OS path delimiters.
-  return encodeURIComponent(key).replace(/%/g, ENCODED_SEP);
+  return encodeURIComponent(key.replaceAll('_', '_u')).replace(/%/g, ENCODED_SEP);
 }
 
 function decodeKey(encoded: string): string {
-  return decodeURIComponent(encoded.replaceAll(ENCODED_SEP, '%'));
+  return decodeURIComponent(encoded.replaceAll(ENCODED_SEP, '%')).replaceAll('_u', '_');
 }
 
 function keyToPath(root: string, key: string): string {
@@ -90,32 +97,52 @@ function ensureDir(dir: string): void {
 /**
  * @public
  * Create a file-backed `StorageAdapter` that writes each key to a JSON
- * file under the configured root directory. Designed to be the default
- * production-mode backing for checkpoint storage — the implementation is
- * synchronous under the hood to minimise partial-write risk on crash,
- * matching the expectation that checkpoint writes are small (kilobytes)
- * and infrequent relative to step execution.
+ * file under the configured root directory. The default production-mode
+ * backing for checkpoint storage.
  *
- * Not optimised for high-throughput workloads. If checkpoint volume
- * becomes a bottleneck, swap for a database-backed adapter.
+ * Writes are async (`node:fs/promises`) via a .tmp sibling + atomic
+ * rename — core checkpoints after EVERY completed step, so a synchronous
+ * write here would block the event loop (token streaming, socket pumps,
+ * watchdog timers) once per step. The tmp+rename pattern keeps the
+ * "half-written file found on restart" window to the rename itself.
+ *
+ * `list(prefix)` is served from an in-memory key index seeded by one
+ * directory scan at construction and maintained on set/delete — the
+ * durable outbound queue and the step ledger call `list` on hot paths,
+ * and a per-call `readdir` over a flat root that also holds every ledger
+ * shard and IPC frame made each call O(total keys).
+ *
+ * The index assumes this adapter instance is the only writer to `root`
+ * for its lifetime (the same assumption the previous implementation made
+ * implicitly for read-modify-write sequences). Two live adapters over one
+ * root would see each other's writes via `get` but not via `list`.
  */
 export function createFileStorage(options: CreateFileStorageOptions = {}): StorageAdapter {
   const root = options.root ?? defaultRoot();
   ensureDir(root);
 
-  function readKey<T>(key: string): T | null {
-    const file = keyToPath(root, key);
-    if (!existsSync(file)) {
-      return null;
+  // Seed the key index from disk once; set/delete maintain it after that.
+  const keyIndex = new Set<string>();
+  for (const file of readdirSync(root)) {
+    const key = pathToKey(file);
+    if (key !== null) {
+      keyIndex.add(key);
     }
+  }
+
+  async function readKey<T>(key: string): Promise<T | null> {
+    const file = keyToPath(root, key);
     try {
-      const raw = readFileSync(file, 'utf8');
+      const raw = await readFile(file, 'utf8');
       if (raw.length === 0) {
         return null;
       }
       const parsed = JSON.parse(raw);
       return typedCast<T>(parsed);
     } catch (err) {
+      if (isErrnoException(err) && err.code === 'ENOENT') {
+        return null;
+      }
       console.warn(`createFileStorage: failed to read "${key}":`, err);
       return null;
     }
@@ -132,42 +159,47 @@ export function createFileStorage(options: CreateFileStorageOptions = {}): Stora
       // Write via a .tmp sibling then rename — reduces the "half-written
       // file found on restart" window to the rename itself. On crash mid-
       // write the main file either still holds the previous value, or the
-      // rename completed.
-      writeFileSync(tmp, JSON.stringify(value));
-      // `renameSync` is the atomic step on POSIX filesystems.
-      renameSync(tmp, file);
+      // rename completed. `rename` is the atomic step on POSIX filesystems.
+      await writeFile(tmp, JSON.stringify(value));
+      await rename(tmp, file);
+      keyIndex.add(key);
     },
     async delete(key: string): Promise<void> {
       const file = keyToPath(root, key);
-      if (!existsSync(file)) {
-        return;
-      }
+      keyIndex.delete(key);
       try {
-        unlinkSync(file);
+        await unlink(file);
       } catch (err) {
+        if (isErrnoException(err) && err.code === 'ENOENT') {
+          return;
+        }
         console.warn(`createFileStorage: failed to delete "${key}":`, err);
       }
     },
     async list(prefix: string): Promise<string[]> {
-      if (!existsSync(root)) {
-        return [];
-      }
-      const files = readdirSync(root);
       const out: string[] = [];
-      for (const file of files) {
-        const key = pathToKey(file);
-        if (key?.startsWith(prefix)) {
+      for (const key of keyIndex) {
+        if (key.startsWith(prefix)) {
           out.push(key);
         }
       }
-      return out;
+      // Callers (step ledger, durable queue) depend on lexicographic order
+      // matching what a sorted directory listing produced.
+      return out.sort();
     },
     async getMany<T>(keys: string[]): Promise<Map<string, T>> {
-      // Local disk has no per-key round trip to save, but implementing this keeps
-      // callers on one code path and skips the promise-per-key the fallback builds.
+      // Parallel reads — local disk has no per-key round trip, but the
+      // batch keeps callers on one code path and overlaps I/O waits. Each
+      // read resolves to its own key so the pairing survives the reorder
+      // a bare `Promise.all` over values would invite.
+      const entries = await Promise.all(
+        keys.map(async (key) => ({
+          key,
+          value: await readKey<T>(key),
+        })),
+      );
       const found = new Map<string, T>();
-      for (const key of keys) {
-        const value = readKey<T>(key);
+      for (const { key, value } of entries) {
         if (value === null) {
           continue;
         }
