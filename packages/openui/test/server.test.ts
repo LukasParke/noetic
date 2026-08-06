@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import type { AgentHarnessContract, Item, StreamEvent } from '@noetic-tools/types';
 import { frameworkCast } from '@noetic-tools/types';
+import { z } from 'zod';
 import { openUiSurface } from '../src';
 import type { OpenUiRequest } from '../src/server';
 import {
@@ -14,6 +15,13 @@ import {
 import { makeExecCtx, makeStorage, testLibrary } from './_helpers';
 
 const AGENT = 'agent';
+
+/** The 202 echo body shape a POST {event} returns (O5). */
+const EventEchoSchema = z.object({
+  accepted: z.boolean(),
+  seq: z.number(),
+  version: z.number(),
+});
 
 function sdk(type: string, data: Record<string, unknown> = {}): StreamEvent {
   return {
@@ -319,3 +327,108 @@ describe('serveOpenUi', () => {
 });
 
 //#endregion
+
+describe('serveOpenUi hardening (O1/O5)', () => {
+  test('concurrent prompt POSTs on one thread get 409 until the stream finishes', async () => {
+    const surface = await initSurface();
+    // Gate the event stream so the turn stays "in flight" until we release it.
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const harness = makeFakeHarness([]);
+    const gated = frameworkCast<AgentHarnessContract & FakeHarness>({
+      ...harness,
+      async *getFullStream() {
+        await gate;
+        yield framework('turn_completed', {
+          turnId: 't1',
+        });
+      },
+    });
+    const handler = serveOpenUi(gated, {
+      surface,
+    });
+    const first = await handler(
+      req('POST', {
+        prompt: 'render something',
+      }),
+    );
+    expect(first.status).toBe(200);
+    // Stream still open — a second prompt must be rejected, not interleaved.
+    const second = await handler(
+      req('POST', {
+        prompt: 'another prompt',
+      }),
+    );
+    expect(second.status).toBe(409);
+    // Completing the turn releases the slot.
+    release?.();
+    await drain(first);
+    const third = await handler(
+      req('POST', {
+        prompt: 'after done',
+      }),
+    );
+    expect(third.status).toBe(200);
+    release?.();
+    await drain(third);
+  });
+
+  test('UI-event POSTs are never blocked by an active stream and echo seq+version (O5)', async () => {
+    const surface = await initSurface();
+    const harness = makeFakeHarness([
+      framework('turn_completed', {
+        turnId: 't1',
+      }),
+    ]);
+    const handler = serveOpenUi(harness, {
+      surface,
+    });
+    const stream = await handler(
+      req('POST', {
+        prompt: 'render',
+      }),
+    );
+    const eventRes = await handler(
+      req('POST', {
+        event: {
+          kind: 'submit',
+          ref: 'form',
+          seq: 5,
+          clientId: 'tab-a',
+        },
+      }),
+    );
+    expect(eventRes.status).toBe(202);
+    const body = EventEchoSchema.parse(await eventRes.json());
+    expect(body.accepted).toBe(true);
+    expect(body.seq).toBe(5);
+    expect(typeof body.version).toBe('number');
+    await drain(stream);
+  });
+
+  test('client disconnect (stream cancel) releases the prompt slot', async () => {
+    const surface = await initSurface();
+    // No turn_completed: the stream would pump forever without cancellation.
+    const handler = serveOpenUi(makeFakeHarness([]), {
+      surface,
+    });
+    const res = await handler(
+      req('POST', {
+        prompt: 'long turn',
+      }),
+    );
+    expect(res.status).toBe(200);
+    // Simulate the client going away.
+    await res.body?.cancel();
+    // The finished-hook must release the slot even though `done` never came.
+    const retry = await handler(
+      req('POST', {
+        prompt: 'after disconnect',
+      }),
+    );
+    expect(retry.status).toBe(200);
+    await drain(retry);
+  });
+});

@@ -118,6 +118,14 @@ describe('afterModelCall folding', () => {
   });
 });
 
+/** Narrow an optional hook-result state without casting. */
+function expectState(state: OpenUiSurfaceState | undefined): OpenUiSurfaceState {
+  if (!state) {
+    throw new Error('expected state');
+  }
+  return state;
+}
+
 describe('onItemAppend ui-event reduction', () => {
   async function applyItems(state: OpenUiSurfaceState, items: Item[], surface = makeSurface()) {
     const onItemAppend = surface.hooks.onItemAppend;
@@ -132,9 +140,12 @@ describe('onItemAppend ui-event reduction', () => {
     });
   }
 
-  test('set events mirror into vars and are dropped from the item pipeline', async () => {
-    const { state } = await initState();
-    const result = await applyItems(state, [
+  test('set events for DECLARED $vars mirror into vars and drop from the pipeline', async () => {
+    const { surface, state } = await initState();
+    // Declare $tab by folding a render first — sets are only accepted for
+    // state vars the document actually declares (O2).
+    const folded = await foldRender(surface, state);
+    const result = await applyItems(expectState(folded.state), [
       createUiEventItem({
         kind: 'set',
         ref: 'tab',
@@ -144,9 +155,71 @@ describe('onItemAppend ui-event reduction', () => {
     ]);
     expect(result.items).toEqual([]);
     expect(result.state?.vars.tab).toBe('b');
-    expect(result.state?.version).toBe(1);
+    expect(result.state?.version).toBe(2); // fold bumped to 1, set to 2
     expect(result.rerender).toBe(true);
     expect(result.timing).toBe('immediate');
+  });
+
+  test('set events for UNDECLARED vars are rejected but still advance the watermark (O2)', async () => {
+    const { state } = await initState(); // empty document — nothing declared
+    const result = await applyItems(state, [
+      createUiEventItem({
+        kind: 'set',
+        ref: 'ghost',
+        payload: 'x',
+        seq: 0,
+      }),
+    ]);
+    expect(result.state?.vars.ghost).toBeUndefined();
+    expect(result.state?.version).toBe(0); // rejected sets don't bump
+    expect(result.state?.appliedEventSeq).toBe(0); // but the event was consumed
+  });
+
+  test('oversized set payloads are rejected (O2)', async () => {
+    const { surface, state } = await initState();
+    const folded = await foldRender(surface, state);
+    const result = await applyItems(expectState(folded.state), [
+      createUiEventItem({
+        kind: 'set',
+        ref: 'tab',
+        payload: 'x'.repeat(20 * 1024),
+        seq: 0,
+      }),
+    ]);
+    expect(result.state?.vars.tab).toBeUndefined();
+  });
+
+  test('per-client watermarks: two clients starting at seq 0 do not shadow each other (O3)', async () => {
+    const { surface, state } = await initState();
+    const folded = await foldRender(surface, state);
+    const afterA = await applyItems(expectState(folded.state), [
+      createUiEventItem({
+        kind: 'submit',
+        ref: 'form',
+        seq: 0,
+        clientId: 'tab-a',
+      }),
+    ]);
+    const afterB = await applyItems(expectState(afterA.state), [
+      createUiEventItem({
+        kind: 'submit',
+        ref: 'form',
+        seq: 0,
+        clientId: 'tab-b',
+      }),
+    ]);
+    // Both applied — the old GLOBAL watermark dropped B's seq-0 as a duplicate.
+    expect(afterB.state?.interactions).toHaveLength(2);
+    // Replays still dedupe per client.
+    const replay = await applyItems(expectState(afterB.state), [
+      createUiEventItem({
+        kind: 'submit',
+        ref: 'form',
+        seq: 0,
+        clientId: 'tab-a',
+      }),
+    ]);
+    expect(replay.state?.interactions).toHaveLength(2);
   });
 
   test('submit events append interactions and stay in the pipeline', async () => {
