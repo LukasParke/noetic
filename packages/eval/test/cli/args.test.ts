@@ -12,7 +12,6 @@ describe('parseCliArgs', () => {
     expect(args.watch).toBe(false);
     expect(args.optimize).toBe(false);
     expect(args.scope).toBe(OptimizeScope.PromptsOnly);
-    expect(args.budget).toBeUndefined();
     expect(args.dryRun).toBe(false);
     expect(args.saveBaseline).toBe(false);
     expect(args.check).toBe(false);
@@ -74,31 +73,54 @@ describe('parseCliArgs', () => {
     ).toThrow(UsageError);
   });
 
-  test('-u and --budget round-trip', () => {
+  test('--budget is no longer a recognised flag (removed dead cost knob)', () => {
+    // The flag was accepted but never read anywhere downstream — a cost
+    // control that silently did nothing. Unknown flags throw.
+    expect(() =>
+      parseCliArgs([
+        '--budget',
+        '12.5',
+      ]),
+    ).toThrow(UsageError);
+  });
+
+  test('--concurrency reads the following argv entry', () => {
+    // Regression: the handler was declared (args, next) against an
+    // ArgHandler of (args, argv, index), so it parsed the whole argv array
+    // and EVERY --concurrency invocation threw a UsageError.
     const args = parseCliArgs([
-      '-u',
-      '--budget',
-      '12.5',
+      '--concurrency',
+      '8',
+      'a.eval.ts',
     ]);
-    expect(args.optimize).toBe(true);
-    expect(args.budget).toBe(12.5);
+    expect(args.concurrency).toBe(8);
+    expect(args.files).toEqual([
+      'a.eval.ts',
+    ]);
   });
 
-  test('--budget without a value throws UsageError', () => {
+  test('--concurrency rejects a missing value', () => {
     expect(() =>
       parseCliArgs([
-        '--budget',
+        '--concurrency',
       ]),
     ).toThrow(UsageError);
   });
 
-  test('--budget with a non-numeric value throws UsageError', () => {
-    expect(() =>
-      parseCliArgs([
-        '--budget',
-        'cheap',
-      ]),
-    ).toThrow(UsageError);
+  test('--concurrency rejects non-positive-integer values', () => {
+    for (const bad of [
+      '0',
+      '-1',
+      '2.5',
+      'many',
+    ]) {
+      expect(() =>
+        parseCliArgs([
+          '--concurrency',
+          bad,
+        ]),
+      ).toThrow(UsageError);
+    }
   });
 
   test('boolean flags toggle', () => {

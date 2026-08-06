@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import type { Step, SubHarness, SubHarnessKind, SubHarnessSession } from '@noetic-tools/core';
-import { spawn, step } from '@noetic-tools/core';
+import { isServerToolSpec, spawn, step, tool } from '@noetic-tools/core';
+import { z } from 'zod';
+import { discoverFields } from '../../src/optimization/field-discovery';
 import { applyCandidate } from '../../src/optimization/mutator';
 
 function mockSubHarness(kind: SubHarnessKind): SubHarness {
@@ -51,6 +53,24 @@ function getLlmModel(s: Step): string {
     throw new Error('Expected eager string model on llm step, got function-form Lazy getter');
   }
   return model;
+}
+
+/** First client tool of an llm step, with its optimizable name/description. */
+function getFirstClientTool(s: Step): {
+  name: string;
+  description: string;
+} {
+  if (s.kind !== 'llm' || !Array.isArray(s.tools)) {
+    throw new Error('Expected an llm step with an eager tool array');
+  }
+  const first = s.tools[0];
+  if (first === undefined || isServerToolSpec(first)) {
+    throw new Error('Expected a client tool at index 0');
+  }
+  return {
+    name: first.name,
+    description: first.description,
+  };
 }
 
 function getSpawnChild(s: Step): Step {
@@ -193,5 +213,48 @@ describe('applyCandidate', () => {
         expect(result.id).toBe(original.id);
       });
     }
+  });
+});
+
+describe('index-keyed tool paths (G2)', () => {
+  test("a tool rename does not orphan the tool's other candidate fields", () => {
+    const searchTool = tool({
+      name: 'search',
+      description: 'original description',
+      input: z.object({}),
+      output: z.string(),
+      execute: async () => 'ok',
+    });
+    const llm = step.llm({
+      id: 'agent',
+      model: 't/m',
+      instructions: 'base',
+      tools: [
+        searchTool,
+      ],
+    });
+
+    // Discovery keys by index, so paths survive a rename.
+    const fields = discoverFields(llm);
+    const paths = fields.map((f) => f.path);
+    expect(paths).toContain('agent.tools.0.name');
+    expect(paths).toContain('agent.tools.0.description');
+
+    // A candidate that BOTH renames the tool and rewrites its description:
+    // with name-keyed paths the description lookup missed after the rename.
+    const mutated = applyCandidate(llm, {
+      'agent.tools.0.name': 'find_docs',
+      'agent.tools.0.description': 'improved description',
+    });
+    const mutatedTool = getFirstClientTool(mutated);
+    expect(mutatedTool.name).toBe('find_docs');
+    expect(mutatedTool.description).toBe('improved description');
+
+    // Applying the same candidate to the ALREADY-mutated tree (as each GEPA
+    // round does) must be stable — the index key still resolves.
+    const twice = applyCandidate(mutated, {
+      'agent.tools.0.description': 'round-two description',
+    });
+    expect(getFirstClientTool(twice).description).toBe('round-two description');
   });
 });

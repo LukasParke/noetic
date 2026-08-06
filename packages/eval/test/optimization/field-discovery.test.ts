@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import type { Step, Tool } from '@noetic-tools/core';
-import { branch, spawn, step } from '@noetic-tools/core';
+import { branch, every, provide, spawn, step } from '@noetic-tools/core';
 import { z } from 'zod';
 import { discoverFields, enrichWithSourceLocations } from '../../src/optimization/field-discovery';
 import { OptimizeScope } from '../../src/types/eval';
@@ -107,6 +107,49 @@ describe('discoverFields', () => {
     expect(fields).toHaveLength(1);
     expect(fields[0].path).toBe('outer-spawn.inner-llm.instructions');
     expect(fields[0].value).toBe('Inner system prompt');
+  });
+
+  test('recurses into StepProvide wrapping a StepLLM', () => {
+    // Regression: `provide` was absent from walkStep's switch, so every
+    // prompt under a provide() wrapper was invisible to GEPA even though
+    // applyCandidate recursed into it.
+    const llmStep = step.llm({
+      id: 'inner-llm',
+      model: 'test-model',
+      instructions: 'Provided system prompt',
+    });
+
+    const provideStep = provide({
+      id: 'outer-provide',
+      child: llmStep,
+      context: [],
+    });
+
+    const fields = discoverFields(provideStep);
+
+    expect(fields).toHaveLength(1);
+    expect(fields[0].path).toBe('outer-provide.inner-llm.instructions');
+    expect(fields[0].value).toBe('Provided system prompt');
+  });
+
+  test('recurses into StepEvery body', () => {
+    const llmStep = step.llm({
+      id: 'body-llm',
+      model: 'test-model',
+      instructions: 'Scheduled system prompt',
+    });
+
+    const everyStep = every({
+      id: 'outer-every',
+      step: llmStep,
+      ms: 0,
+    });
+
+    const fields = discoverFields(everyStep);
+
+    expect(fields).toHaveLength(1);
+    expect(fields[0].path).toBe('outer-every.body-llm.instructions');
+    expect(fields[0].value).toBe('Scheduled system prompt');
   });
 
   test('finds fields in branch _optimizable children', () => {

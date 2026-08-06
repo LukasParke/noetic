@@ -55,24 +55,30 @@ function extractLlmFields(
   if (!Array.isArray(step.tools)) {
     return;
   }
-  for (const t of step.tools) {
+  /* Tool fields are keyed by array INDEX, not by name. The name is itself an
+   * optimizable field: keying by it meant a candidate that renamed a tool
+   * invalidated every other candidate key for that tool on the next
+   * applyCandidate pass (lookup by new name, keys built from old name), and
+   * two tools could collide if the teacher renamed one onto the other. The
+   * index is stable for the lifetime of an optimization run. */
+  step.tools.forEach((t, i) => {
     // Server tools (web_search/web_fetch) carry no optimizable name/description.
     if (isServerToolSpec(t)) {
-      continue;
+      return;
     }
     fields.push({
-      path: `${path}.tools.${t.name}.description`,
+      path: `${path}.tools.${i}.description`,
       value: t.description,
       stepId: step.id,
       fieldKind: FieldKind.ToolDescription,
     });
     fields.push({
-      path: `${path}.tools.${t.name}.name`,
+      path: `${path}.tools.${i}.name`,
       value: t.name,
       stepId: step.id,
       fieldKind: FieldKind.ToolName,
     });
-  }
+  });
 }
 
 function extractToolFields(
@@ -127,14 +133,36 @@ function walkStep(step: Step, prefix: string, fields: OptimizableField[]): void 
         walkStep(s, `${path}.`, fields);
       }
       return;
+    case 'provide':
+      /* `provide` was missing: its child subtree was invisible to discovery
+       * while `applyCandidate` happily recursed into it, so every prompt
+       * under a provide() wrapper was silently excluded from optimization. */
+      walkStep(step.child, `${path}.`, fields);
+      return;
+    case 'every':
+      walkStep(step.step, `${path}.`, fields);
+      return;
     case 'branch':
       walkOptimizableChildren(step._optimizable, path, fields);
       return;
     case 'fork':
       walkOptimizableChildren(step._optimizable, path, fields);
       return;
+    // `run` holds no text fields. Sub-harness steps carry their prompt and
+    // instructions as Lazy<string>, a surface the mutator does not model
+    // (see mutator.ts) — discovering them would produce candidate keys that
+    // applyCandidate ignores.
     case 'run':
+    case 'claude-code':
+    case 'codex':
+    case 'opencode':
+    case 'pi':
       return;
+    default: {
+      const exhaustive: never = step;
+      void exhaustive;
+      return;
+    }
   }
 }
 

@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { step } from '@noetic-tools/core';
+import { step, tool } from '@noetic-tools/core';
+import { z } from 'zod';
 
 import { buildWriteBackEntries, optimize } from '../../src/optimization/optimizer';
 import { OptimizeScope } from '../../src/types/eval';
@@ -161,6 +162,47 @@ describe('optimize() write-back semantics', () => {
     expect(result.fields).toHaveLength(0);
     expect(result.writtenBack).toBe(false);
     expect(result.iterations).toBe(0);
+  });
+});
+
+//#endregion
+
+//#region scope reaches discovery (G1)
+
+describe('optimize() honors scope (G1)', () => {
+  test('PromptsOnly never discovers ToolName fields for programmatic callers', async () => {
+    const searchTool = tool({
+      name: 'search',
+      description: 'find things',
+      input: z.object({}),
+      output: z.string(),
+      execute: async () => 'ok',
+    });
+    const testStep = step.llm({
+      id: 'agent',
+      model: 'openai/gpt-4o-mini',
+      instructions: 'base instructions',
+      tools: [
+        searchTool,
+      ],
+    });
+
+    // No preEnrichedFields: this is the programmatic path where the scope
+    // used to be silently dropped and ToolName fields leaked into the
+    // optimization (and write-back).
+    const result = await optimize({
+      step: testStep,
+      scope: OptimizeScope.PromptsOnly,
+      dryRun: true,
+      runEval: async () => ({
+        'case.scorer': 0.5,
+      }),
+    });
+
+    const kinds = new Set(result.fields.map((f) => f.fieldKind));
+    expect(kinds.has(FieldKind.ToolName)).toBe(false);
+    expect(kinds.has(FieldKind.Instructions)).toBe(true);
+    expect(kinds.has(FieldKind.ToolDescription)).toBe(true);
   });
 });
 

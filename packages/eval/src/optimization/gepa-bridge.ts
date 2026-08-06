@@ -4,6 +4,7 @@ import type { Step } from '@noetic-tools/core';
 import { frameworkCast } from '@noetic-tools/core/unstable';
 
 import type { Candidate, OptimizableField, OptimizationResult } from '../types/optimizer';
+import { runPool } from '../utils/run-pool';
 import { averageNumbers } from '../utils/scores';
 import { applyCandidate } from './mutator';
 
@@ -23,7 +24,6 @@ export interface OptimizeParams {
   runEval: (step: Step) => Promise<Record<string, number>>;
   examples?: ReadonlyArray<Record<string, unknown>>;
   maxMetricCalls?: number;
-  budget?: number;
   gepa?: GepaConfig;
 }
 
@@ -65,6 +65,9 @@ const DEFAULT_TEACHER_MODEL = 'openai/gpt-4o';
 const DEFAULT_NUM_TRIALS = 5;
 const DEFAULT_EARLY_STOPPING = 3;
 const DEFAULT_MAX_METRIC_CALLS = 10;
+
+/** Concurrent teacher proposals per reflection round (independent LLM calls). */
+const PROPOSAL_CONCURRENCY = 4;
 
 /**
  * The student program is a fixed single-component carrier: GEPA mutates its
@@ -175,6 +178,11 @@ function createAiService(model: string, apiKey: string): ReturnType<typeof ai> {
   });
 }
 
+/**
+ * Shape-compat only: ax's compile() insists on a non-trivial example list even
+ * though the custom adapter's evaluate ignores it (scores come from runEval
+ * against the whole suite). Two phantom rows satisfy the API minimum.
+ */
 function buildExampleBatch(
   examples: ReadonlyArray<Record<string, unknown>> | undefined,
 ): EvalDatum[] {
@@ -334,7 +342,9 @@ export function createGepaAdapter(
 
     // Takes precedence over GEPA's free-form reflection, which would destroy
     // the field markers. The teacher improves each field value individually
-    // and WE reassemble the marker structure.
+    // and WE reassemble the marker structure. Proposals run through a
+    // bounded pool — they are independent LLM calls, and a 12-field step
+    // paid 12 sequential teacher round trips per GEPA iteration serially.
     async propose_new_texts(
       candidate: Readonly<Record<string, string>>,
       reflectiveDataset: Readonly<Record<string, unknown[]>>,
@@ -346,15 +356,21 @@ export function createGepaAdapter(
         const parsed = parseFieldText(currentText) ?? initialCandidate;
         const feedback = extractFeedback(reflectiveDataset[component]);
 
+        const proposals = await runPool(
+          fieldOrder.map((path) => () => {
+            const currentValue = parsed[path] ?? initialCandidate[path] ?? '';
+            return safePropose({
+              path,
+              currentValue,
+              feedback,
+            });
+          }),
+          PROPOSAL_CONCURRENCY,
+        );
         const improved: Candidate = {};
-        for (const path of fieldOrder) {
-          const currentValue = parsed[path] ?? initialCandidate[path] ?? '';
-          improved[path] = await safePropose({
-            path,
-            currentValue,
-            feedback,
-          });
-        }
+        fieldOrder.forEach((path, i) => {
+          improved[path] = proposals[i];
+        });
         result[component] = serializeFields(improved, fieldOrder);
       }
       return result;
@@ -366,6 +382,12 @@ export function createGepaAdapter(
 
 //#region Candidate Extraction
 
+/**
+ * Shape-compat only: `optimizer.compile` requires a metric function, but with
+ * a custom `gepaAdapter` (which we always pass) scoring flows through the
+ * adapter's `evaluate` → `runEval`, never through per-prediction extraction.
+ * Do not extend this expecting it to affect optimization.
+ */
 function extractPredictionScores(
   args: Readonly<{
     prediction: unknown;
