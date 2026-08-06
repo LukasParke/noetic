@@ -398,6 +398,51 @@ export interface SubflowWorkflowNode extends WorkflowNodeBase {
   input?: string;
 }
 
+/**
+ * An llm node whose tool pool includes agents exposed as tools. Agents are
+ * named references resolved from the hydration context's agent registry —
+ * compiled definitions carry closures (Lazy fields, tool executes) and are
+ * never embedded in JSON.
+ */
+export interface AgentToolWorkflowNode extends WorkflowNodeBase {
+  kind: 'agent-tool';
+  /** Orchestrator model id. */
+  model?: string;
+  instructions: string;
+  /** Registered agent names exposed to the orchestrator as callable tools (min 1). */
+  agents: string[];
+  /** Additional plain tool names from the tool registry. */
+  tools?: string[];
+}
+
+/** A routing swarm over registered agents (see the `handoff` pattern). */
+export interface HandoffWorkflowNode extends WorkflowNodeBase {
+  kind: 'handoff';
+  /** Registered agent names participating in the swarm (min 2). */
+  agents: string[];
+  /** Name of the agent that owns the conversation first. */
+  entry?: string;
+  maxIterations?: number;
+}
+
+/** A quorum/panel over registered agents (see the `quorum` pattern). */
+export interface QuorumWorkflowNode extends WorkflowNodeBase {
+  kind: 'quorum';
+  /** Registered agent names on the panel (min 1). */
+  agents: string[];
+  vote:
+    | {
+        kind: 'majority' | 'first' | 'all';
+      }
+    | {
+        kind: 'judge';
+        /** Registered agent name that reduces the candidates. */
+        judge: string;
+        criteria?: string;
+      };
+  concurrency?: number;
+}
+
 /** @public Discriminated union of all JSON-serialisable workflow node kinds. */
 export type WorkflowNode =
   | LlmWorkflowNode
@@ -411,7 +456,10 @@ export type WorkflowNode =
   | SequenceWorkflowNode
   | EveryWorkflowNode
   | SubflowWorkflowNode
-  | SubHarnessWorkflowNode;
+  | SubHarnessWorkflowNode
+  | AgentToolWorkflowNode
+  | HandoffWorkflowNode
+  | QuorumWorkflowNode;
 
 //#endregion
 
@@ -572,6 +620,46 @@ const CodexNodeSchema = subHarnessNodeSchema('codex');
 const OpencodeNodeSchema = subHarnessNodeSchema('opencode');
 const PiNodeSchema = subHarnessNodeSchema('pi');
 
+const AgentToolNodeSchema = z.object({
+  kind: z.literal('agent-tool'),
+  ...SHARED_FIELDS,
+  model: z.string().min(1).optional(),
+  instructions: z.string(),
+  agents: z.array(z.string().min(1)).min(1),
+  tools: z.array(z.string().min(1)).optional(),
+});
+
+const HandoffNodeSchema = z.object({
+  kind: z.literal('handoff'),
+  ...SHARED_FIELDS,
+  agents: z.array(z.string().min(1)).min(2),
+  entry: z.string().min(1).optional(),
+  maxIterations: z.number().int().positive().optional(),
+});
+
+const QuorumVoteSchema = z.union([
+  z.object({
+    kind: z.enum([
+      'majority',
+      'first',
+      'all',
+    ]),
+  }),
+  z.object({
+    kind: z.literal('judge'),
+    judge: z.string().min(1),
+    criteria: z.string().optional(),
+  }),
+]);
+
+const QuorumNodeSchema = z.object({
+  kind: z.literal('quorum'),
+  ...SHARED_FIELDS,
+  agents: z.array(z.string().min(1)).min(1),
+  vote: QuorumVoteSchema,
+  concurrency: z.number().int().positive().optional(),
+});
+
 /** @public Zod schema validating a single `WorkflowNode` (any JSON-safe kind). */
 export const WorkflowNodeSchema: z.ZodType<WorkflowNode> = z
   .discriminatedUnion('kind', [
@@ -590,6 +678,9 @@ export const WorkflowNodeSchema: z.ZodType<WorkflowNode> = z
     CodexNodeSchema,
     OpencodeNodeSchema,
     PiNodeSchema,
+    AgentToolNodeSchema,
+    HandoffNodeSchema,
+    QuorumNodeSchema,
   ])
   .meta({
     id: 'WorkflowNode',

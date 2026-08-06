@@ -76,6 +76,21 @@ export interface HydrationContext {
    * Threaded internally by the subflow hydrator — callers never set it.
    */
   subflowAncestry?: ReadonlySet<string>;
+  /**
+   * Hydrators for node kinds contributed by a layer above this one, keyed by
+   * `kind` — the extension seam for node kinds whose builders live outside
+   * `builders/`. The pattern layer teaches the JSON runtime about the
+   * `agent-tool` / `handoff` / `quorum` kinds this way
+   * (`nodeHydrators: agentNodeHydrators(myAgents)`), so the hydrator never
+   * imports back into `patterns/`. Registries those kinds need — compiled
+   * agents, for instance — are captured by the contributing factory rather
+   * than added here.
+   *
+   * Built-in kinds always win, so an entry may add a kind but never shadow
+   * one. The map threads to child nodes with the rest of the context, so a
+   * contributed kind works at any depth.
+   */
+  nodeHydrators?: ReadonlyMap<string, NodeHydrator>;
 }
 
 interface SubHarnessBuilderOpts {
@@ -89,7 +104,13 @@ interface SubHarnessBuilderOpts {
 
 type SubHarnessStepBuilder = (opts: SubHarnessBuilderOpts) => Step<ContextData, string, string>;
 
-type NodeHydrator = (
+/**
+ * @public Converts one `WorkflowNode` into a live `Step`.
+ *
+ * Exported so a higher layer can contribute hydrators for its own node kinds
+ * via `HydrationContext.nodeHydrators`.
+ */
+export type NodeHydrator = (
   node: WorkflowNode,
   ctx: HydrationContext,
 ) => Step<ContextData, string, string>;
@@ -748,7 +769,14 @@ const NODE_HYDRATORS: Record<string, NodeHydrator> = {
 
 //#region Helpers
 
-function resolveTools(
+/**
+ * Resolves workflow tool-name references against the registry.
+ *
+ * @internal Shared with node hydrators contributed through
+ * `HydrationContext.nodeHydrators`, so a contributed kind reports missing
+ * tools with the same `UNKNOWN_TOOL_REFERENCE` error as the built-in kinds.
+ */
+export function resolveTools(
   toolNames: string[] | undefined,
   registry: ReadonlyMap<string, Tool>,
 ): Tool[] {
@@ -988,15 +1016,24 @@ export function hydrateNode(
   node: WorkflowNode,
   ctx: HydrationContext,
 ): Step<ContextData, string, string> {
-  const hydrator = NODE_HYDRATORS[node.kind];
+  // Built-in kinds first: a contributed hydrator may add a kind, never shadow one.
+  const hydrator = NODE_HYDRATORS[node.kind] ?? ctx.nodeHydrators?.get(node.kind);
   if (!hydrator) {
     throw new NoeticConfigError({
       code: 'UNKNOWN_NODE_KIND',
       message: `Unknown workflow node kind: '${node.kind}'.`,
-      hint: `Supported kinds: ${Object.keys(NODE_HYDRATORS).join(', ')}.`,
+      hint: `Supported kinds: ${supportedKinds(ctx).join(', ')}.`,
     });
   }
   return hydrator(node, ctx);
+}
+
+/** Every node kind this hydration context can build: built-ins plus contributions. */
+function supportedKinds(ctx: HydrationContext): string[] {
+  return [
+    ...Object.keys(NODE_HYDRATORS),
+    ...(ctx.nodeHydrators?.keys() ?? []),
+  ];
 }
 
 /**

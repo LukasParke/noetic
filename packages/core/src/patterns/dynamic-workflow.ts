@@ -22,6 +22,8 @@ import { hydrateWorkflow } from '../builders/workflow-hydrator';
 import { NoeticAttr } from '../observability/genai-attributes';
 import type { WorkflowDocument } from '../schemas/workflow';
 import { validateWorkflow, workflowDepth, workflowGraph } from '../schemas/workflow';
+import type { AgentRegistry } from './agent-nodes';
+import { agentNodeHydrators } from './agent-nodes';
 
 //#region Types
 
@@ -42,6 +44,13 @@ export interface DynamicWorkflowOpts {
   subHarnesses?: ReadonlyMap<SubHarnessKind, SubHarness>;
   uiLibraries?: ReadonlyMap<string, OutputCodec>;
   workflows?: ReadonlyMap<string, WorkflowDocument>;
+  /**
+   * Compiled agents a generated `agent-tool` / `handoff` / `quorum` node may
+   * reference by name. Supplying them also unlocks those node kinds in the
+   * planner's vocabulary; without a registry the planner is never told about
+   * them, so it cannot emit an unresolvable agent reference.
+   */
+  agents?: AgentRegistry;
 }
 
 //#endregion
@@ -96,6 +105,7 @@ Respond with ONLY the JSON document, no markdown fences or explanation.`;
  * @param opts.subHarnesses - SubHarness adapters a generated `claude-code`/`codex`/… node resolves against.
  * @param opts.uiLibraries - Output codecs a generated `llm` node's `output` codec ref resolves against.
  * @param opts.workflows - Named sub-workflows a generated `subflow` node may reference via `ref`.
+ * @param opts.agents - Compiled agents a generated `agent-tool`/`handoff`/`quorum` node may reference by name. Supplying them adds those kinds to the planner's vocabulary.
  * @returns A `Step` that dynamically plans and executes.
  */
 export function dynamicWorkflow(opts: DynamicWorkflowOpts): Step<ContextData, string, string> {
@@ -120,6 +130,7 @@ export function dynamicWorkflow(opts: DynamicWorkflowOpts): Step<ContextData, st
       const basePrompt = [
         opts.instructions,
         PLANNER_INSTRUCTIONS,
+        agentPlannerSection(opts.agents),
         `\nAvailable tools:\n${toolList}`,
         `\nTask: ${input}`,
       ]
@@ -163,6 +174,11 @@ export function dynamicWorkflow(opts: DynamicWorkflowOpts): Step<ContextData, st
           subHarnesses: opts.subHarnesses,
           uiLibraries: opts.uiLibraries,
           workflows: opts.workflows,
+          ...(opts.agents
+            ? {
+                nodeHydrators: agentNodeHydrators(opts.agents),
+              }
+            : {}),
         };
 
         /* Hydration failures (unknown tool/harness/layer/workflow refs) are
@@ -181,7 +197,7 @@ export function dynamicWorkflow(opts: DynamicWorkflowOpts): Step<ContextData, st
               throw new NoeticConfigError({
                 code: 'WORKFLOW_VALIDATION_FAILED',
                 message: `Failed to generate a hydratable workflow after ${maxRevisions} attempts: ${lastError}`,
-                hint: 'The planner referenced unregistered tools/harnesses/layers/workflows. Register them in DynamicWorkflowOpts or steer the planner away from them.',
+                hint: 'The planner referenced unregistered tools/agents/harnesses/layers/workflows. Register them in DynamicWorkflowOpts or steer the planner away from them.',
               });
             }
             continue;
@@ -216,6 +232,11 @@ export interface ParseAndRunWorkflowOpts {
   layers?: ReadonlyMap<string, ContextLayer>;
   /** Named sub-workflows the document's `subflow` nodes may reference via `ref`. */
   workflows?: ReadonlyMap<string, WorkflowDocument>;
+  /**
+   * Compiled agents the document's `agent-tool` / `handoff` / `quorum` nodes
+   * reference by name. Omit and those node kinds are unknown to hydration.
+   */
+  agents?: AgentRegistry;
 }
 
 /**
@@ -248,6 +269,11 @@ export async function parseAndRunWorkflow(opts: ParseAndRunWorkflowOpts): Promis
     executeStep,
     layers: opts.layers,
     workflows: opts.workflows,
+    ...(opts.agents
+      ? {
+          nodeHydrators: agentNodeHydrators(opts.agents),
+        }
+      : {}),
   };
 
   const hydrated = hydrateWorkflow(parseResult.doc, hydrationCtx);
@@ -322,6 +348,29 @@ function buildToolMap(tools: Tool[]): Map<string, Tool> {
       t,
     ]),
   );
+}
+
+/**
+ * The agent-node half of the planner prompt, emitted only when agents are
+ * registered. Advertising a node kind the host cannot resolve is how a planner
+ * burns its whole revision budget, so an empty registry stays silent.
+ */
+function agentPlannerSection(agents: AgentRegistry | undefined): string | undefined {
+  if (!agents || agents.size === 0) {
+    return undefined;
+  }
+  const roster = [
+    ...agents.values(),
+  ]
+    .map((a) => `- ${a.name}: ${a.description}`)
+    .join('\n');
+  return `These agent node kinds are also available, referencing agents by name:
+- { "kind": "agent-tool", "id": "<unique>", "instructions": "<prompt>", "agents": ["<agent-name>", ...], "tools": ["<tool-name>", ...] } (an orchestrator turn that can call each agent as a tool)
+- { "kind": "handoff", "id": "<unique>", "agents": ["<agent-name>", ...], "entry": "<optional agent-name>" } (a routing swarm over 2+ agents on one shared conversation)
+- { "kind": "quorum", "id": "<unique>", "agents": ["<agent-name>", ...], "vote": { "kind": "majority"|"first"|"all" } | { "kind": "judge", "judge": "<agent-name>", "criteria": "<optional>" } } (a panel that answers in parallel, then reduces)
+
+Registered agents:
+${roster}`;
 }
 
 function coerceToString(value: unknown): string {

@@ -37,7 +37,7 @@ export { spawn } from './builders/spawn-builder';
 /** @public */
 export { tool, toolWithGenerator } from './builders/tool-builder';
 /** @public */
-export type { HydrationContext } from './builders/workflow-hydrator';
+export type { HydrationContext, NodeHydrator } from './builders/workflow-hydrator';
 /** @public */
 export { hydrateNode, hydrateWorkflow } from './builders/workflow-hydrator';
 /** @public */
@@ -187,6 +187,10 @@ export { createInMemoryStorage } from './runtime/in-memory-storage';
 //#region Patterns
 
 /** @public */
+export type { AgentRegistry } from './patterns/agent-nodes';
+/** @public */
+export { agentNodeHydrators } from './patterns/agent-nodes';
+/** @public */
 export type {
   Agent,
   AgentDef,
@@ -259,14 +263,17 @@ export { getRegistry, lookupStep, registerStep } from './runtime/step-registry';
 export { defaultItemSchemaRegistry, ItemSchema, ItemSchemaRegistry } from '@noetic-tools/types';
 /** @public */
 export type {
+  AgentToolWorkflowNode,
   BranchRoute,
   BranchWorkflowNode,
   EveryWorkflowNode,
   ForkWorkflowNode,
+  HandoffWorkflowNode,
   LlmWorkflowNode,
   LoopWorkflowNode,
   MergeStrategy,
   ProvideWorkflowNode,
+  QuorumWorkflowNode,
   SequenceWorkflowNode,
   SpawnWorkflowNode,
   SubflowWorkflowNode,

@@ -5,14 +5,17 @@
  */
 
 export type {
+  AgentToolWorkflowNode,
   BranchRoute,
   BranchWorkflowNode,
   EveryWorkflowNode,
   ForkWorkflowNode,
+  HandoffWorkflowNode,
   LlmWorkflowNode,
   LoopWorkflowNode,
   OutputCodecRef,
   ProvideWorkflowNode,
+  QuorumWorkflowNode,
   RunWorkflowNode,
   SequenceWorkflowNode,
   SpawnWorkflowNode,
