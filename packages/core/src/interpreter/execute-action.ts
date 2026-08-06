@@ -30,7 +30,10 @@ import {
   DEFAULT_PROJECTION,
   defaultItemSchemaRegistry,
   emitFrameworkEvent,
+  foldCompactions,
   getBroadcaster,
+  hasCompaction,
+  historyPressure,
   lineageKey,
   noteCacheOutcome,
   resolveCacheConfig,
@@ -402,6 +405,72 @@ function finalizeStepOutput<O>(params: {
   return frameworkCast<O>(params.lastText);
 }
 
+/**
+ * Emit `context_pressure` when the folded history has crossed the policy's
+ * `compactAt` threshold, at most once per assembly.
+ *
+ * `assembleView` still enforces the token budget by dropping the oldest turns,
+ * but it does so silently. This is the signal that lets an agent (or the host
+ * app) record a compaction — replacing that prefix with a summary — instead of
+ * losing it. Measured post-fold, so a compaction genuinely turns the signal off.
+ *
+ * Returns the new "already emitted" state, so the caller tracks the once-only
+ * guarantee without branching on it: a steering retry re-sends the same view, so
+ * re-emitting would only repeat itself.
+ */
+function emitContextPressureOnce(params: {
+  historyItems: ReadonlyArray<Item>;
+  policy: ProjectionPolicy;
+  nodeId: string;
+  emit: EmitOption | undefined;
+  ctx: Context<ContextData>;
+  alreadyEmitted: boolean;
+}): boolean {
+  if (params.alreadyEmitted) {
+    return true;
+  }
+  const pressure = historyPressure(params.historyItems, params.policy);
+  if (!pressure.overThreshold) {
+    return true;
+  }
+  const data = {
+    nodeId: params.nodeId,
+    historyTokens: pressure.historyTokens,
+    compactAt: pressure.compactAt,
+  };
+  if (!shouldEmit(params.emit, 'context_pressure', data)) {
+    return true;
+  }
+  emitFrameworkEvent({
+    broadcaster: getBroadcaster(params.ctx),
+    agentName: params.ctx.harness.config.name,
+    eventType: 'context_pressure',
+    data,
+  });
+  return true;
+}
+
+/**
+ * The history to send when no context layers are configured: folded if the log
+ * carries a compaction (the model must read the summary, never the raw record),
+ * otherwise passed through — preserving the array identity that lets an
+ * unprojected turn skip a copy.
+ */
+function historyForBareRequest(params: {
+  projected: ReadonlyArray<Item>;
+  raw: ReadonlyArray<Item>;
+}): ReadonlyArray<Item> {
+  if (hasCompaction(params.projected)) {
+    return foldCompactions(params.projected);
+  }
+  if (params.projected === params.raw) {
+    return params.raw;
+  }
+  return [
+    ...params.projected,
+  ];
+}
+
 export async function executeLLM<TContext, I, O>(
   step: StepLLM<TContext, I, O>,
   input: I,
@@ -574,6 +643,7 @@ export async function executeLLM<TContext, I, O>(
   // live band and the supersedes, rather than wherever history happens to put it.
   let steeringTail: InputMessageItem[] = [];
   let cacheJudged = false;
+  let pressureEmitted = false;
 
   while (retries <= MAX_STEERING_RETRIES) {
     const rawHistoryItems: ReadonlyArray<Item> = baseCtx.itemLog.items;
@@ -599,22 +669,34 @@ export async function executeLLM<TContext, I, O>(
         }
         nonSystemHistory.push(item);
       }
+      // Fold recorded compactions BEFORE the bands claim their budget: a
+      // compaction that replaced 400 turns with a paragraph should shrink what
+      // the assembler has to fit, not just sit in the log. Folding here rather
+      // than inside assembleView keeps the band signature untouched.
+      const foldedHistory = foldCompactions(nonSystemHistory);
+      // Announce the trim that is coming, before the assembler performs it.
+      pressureEmitted = emitContextPressureOnce({
+        historyItems: foldedHistory,
+        policy: viewPolicy,
+        nodeId: step.id,
+        emit: step.emit,
+        ctx: baseCtx,
+        alreadyEmitted: pressureEmitted,
+      });
       assembledItems = assembleView({
         systemPromptItems: systemItems,
         layerOutputItems: banded.anchorItems,
-        historyItems: nonSystemHistory,
+        historyItems: foldedHistory,
         liveLayerItems: banded.liveItems,
         deltaItems: banded.deltaItems,
         tailItems: steeringTail,
         policy: viewPolicy,
       });
     } else {
-      assembledItems =
-        projectedHistoryItems === rawHistoryItems
-          ? rawHistoryItems
-          : [
-              ...projectedHistoryItems,
-            ];
+      assembledItems = historyForBareRequest({
+        projected: projectedHistoryItems,
+        raw: rawHistoryItems,
+      });
     }
 
     const _serverTools = serverToolSpecs.length > 0 ? serverToolSpecs : undefined;

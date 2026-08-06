@@ -9,17 +9,30 @@
 
 /** @unstable Budget allocation algorithm for context layer token budgets. */
 /** @unstable Layer state store type for managing per-layer state during execution. */
-export type { BudgetAllocation, BudgetLimits, LayerStateStore } from '@noetic-tools/context';
+/** @unstable Measured history pressure against a projection policy's compaction threshold. */
+export type {
+  BudgetAllocation,
+  BudgetLimits,
+  HistoryPressure,
+  LayerStateStore,
+} from '@noetic-tools/context';
 /** @unstable Budget allocation and checking utilities. */
 /** @unstable Factory for creating layer state stores. */
 /** @unstable View assembly algorithm that converges context layer outputs into the LLM context. */
 /** @unstable Factory for creating scoped storage wrappers around a StorageAdapter. */
+/** @unstable Compaction: record a summary that replaces a history prefix, and project the folded view. */
 export {
   allocateBudgets,
   assembleView,
   checkBudget,
+  compactHistory,
+  compactionAsItem,
+  createCompaction,
   createLayerStateStore,
   createScopedStorage,
+  foldCompactions,
+  hasCompaction,
+  historyPressure,
 } from '@noetic-tools/context';
 /** @unstable Unsafe cast utility for bridging internal type boundaries. */
 export { frameworkCast } from '@noetic-tools/types';

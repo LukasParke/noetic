@@ -21,6 +21,8 @@ import {
   DEFAULT_PROJECTION,
   disposeLayers,
   executeRerender,
+  foldCompactions,
+  hasCompaction,
   initLayers,
   projectHistoryLayers,
   recallLayers,
@@ -1178,8 +1180,11 @@ export class AgentHarness<TParams extends Record<string, unknown> = Record<strin
       context: this._contextLayers,
     });
     const layers = ctx.layers ?? [];
+    // Fold before returning either way: a preview that showed the raw
+    // compaction record instead of the summary the model actually reads would
+    // be lying about the request.
     if (layers.length === 0) {
-      return historyItems;
+      return hasCompaction(historyItems) ? foldCompactions(historyItems) : historyItems;
     }
     try {
       /* `transient`: this context's state is torn down in the `finally` below, so
@@ -1206,17 +1211,20 @@ export class AgentHarness<TParams extends Record<string, unknown> = Record<strin
         budgets: new Map(),
         readOnly: true,
       });
+      const foldedHistory = hasCompaction(historyItems)
+        ? foldCompactions(historyItems)
+        : historyItems;
       if (
         banded.anchorItems.length === 0 &&
         banded.liveItems.length === 0 &&
         banded.deltaItems.length === 0
       ) {
-        return historyItems;
+        return foldedHistory;
       }
       return assembleView({
         systemPromptItems: [],
         layerOutputItems: banded.anchorItems,
-        historyItems,
+        historyItems: foldedHistory,
         liveLayerItems: banded.liveItems,
         deltaItems: banded.deltaItems,
       });
