@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import assert from 'node:assert';
+import { defineSubHarness } from '@noetic-tools/sub-harness';
 import type {
   Item,
   StepSubHarness,
@@ -555,4 +556,170 @@ describe('executeSubHarness', () => {
   });
 
   //#endregion
+});
+
+describe('sub-harness reliability (round 6)', () => {
+  it("S1: a turn finishing with finishReason 'error' throws step_failed instead of returning", async () => {
+    const failing = defineSubHarness({
+      harnessId: 'claude-code',
+      runner: async function* () {
+        yield {
+          type: 'text-delta' as const,
+          delta: 'partial work before crash',
+        };
+        yield {
+          type: 'finish' as const,
+          finishReason: 'error' as const,
+        };
+      },
+    });
+    const harness = new AgentHarness({
+      name: 'test',
+      params: {},
+    });
+    const ctx = harness.createContext();
+    const s = step.claudeCode({
+      id: 'failing-turn',
+      harness: failing,
+      prompt: 'do the thing',
+    });
+    let thrown: unknown;
+    try {
+      await harness.run(s, '', ctx);
+    } catch (e) {
+      thrown = e;
+    }
+    assert(isNoeticError(thrown));
+    expect(thrown.noeticError.kind).toBe('step_failed');
+    expect(thrown.message).toContain('partial work before crash');
+    // The spend/transcript are still applied — the evidence is in the log.
+    expect(ctx.itemLog.items.some((i) => i.type === 'message' && i.role === 'assistant')).toBe(
+      true,
+    );
+  });
+
+  it('S2: a stalled turn is cut by the idle watchdog', async () => {
+    const stalling = defineSubHarness({
+      harnessId: 'claude-code',
+      runner: async function* (input) {
+        yield {
+          type: 'text-delta' as const,
+          delta: 'starting…',
+        };
+        // Hang until aborted.
+        await new Promise<void>((resolve) => {
+          input.signal?.addEventListener('abort', () => resolve(), {
+            once: true,
+          });
+        });
+        throw new Error('aborted by watchdog');
+      },
+    });
+    const harness = new AgentHarness({
+      name: 'test',
+      params: {},
+    });
+    const ctx = harness.createContext();
+    const s = step.claudeCode({
+      id: 'stalling-turn',
+      harness: stalling,
+      prompt: 'hang forever',
+      settings: {
+        extra: {
+          idleTimeoutMs: 50,
+        },
+      },
+    });
+    let thrown: unknown;
+    const t0 = performance.now();
+    try {
+      await harness.run(s, '', ctx);
+    } catch (e) {
+      thrown = e;
+    }
+    expect(performance.now() - t0).toBeLessThan(5_000);
+    assert(isNoeticError(thrown));
+    expect(thrown.noeticError.kind).toBe('step_failed');
+    expect(thrown.message).toContain('idle');
+  });
+
+  it('S3: reasoning deltas are preserved as a reasoning item in the log', async () => {
+    const thinking = defineSubHarness({
+      harnessId: 'claude-code',
+      runner: async function* () {
+        yield {
+          type: 'reasoning-delta' as const,
+          delta: 'let me think about this…',
+        };
+        yield {
+          type: 'text-delta' as const,
+          delta: 'the answer',
+        };
+        yield {
+          type: 'finish' as const,
+          finishReason: 'stop' as const,
+        };
+      },
+    });
+    const harness = new AgentHarness({
+      name: 'test',
+      params: {},
+    });
+    const ctx = harness.createContext();
+    const result = await harness.run(
+      step.claudeCode({
+        id: 'thinking-turn',
+        harness: thinking,
+        prompt: 'think then answer',
+      }),
+      '',
+      ctx,
+    );
+    expect(result).toBe('the answer');
+    const reasoning = ctx.itemLog.items.find((i) => i.type === 'reasoning');
+    expect(JSON.stringify(reasoning)).toContain('let me think');
+  });
+
+  it('S4: two steps racing on one reuse key start exactly one session', async () => {
+    let starts = 0;
+    const counting = defineSubHarness({
+      harnessId: 'claude-code',
+      runner: async function* () {
+        yield {
+          type: 'text-delta' as const,
+          delta: 'ok',
+        };
+        yield {
+          type: 'finish' as const,
+          finishReason: 'stop' as const,
+        };
+      },
+    });
+    const slowStart: typeof counting = {
+      ...counting,
+      async doStart(opts) {
+        starts++;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return counting.doStart(opts);
+      },
+    };
+    const harness = new AgentHarness({
+      name: 'test',
+      params: {},
+    });
+    const mk = (id: string) =>
+      step.claudeCode({
+        id,
+        harness: slowStart,
+        prompt: 'go',
+        session: {
+          reuse: 'shared-session',
+        },
+      });
+    await Promise.all([
+      harness.run(mk('racer-1'), '', harness.createContext()),
+      harness.run(mk('racer-2'), '', harness.createContext()),
+    ]);
+    expect(starts).toBe(1);
+  });
 });

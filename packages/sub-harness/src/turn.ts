@@ -12,7 +12,7 @@ import type {
   SubHarnessTurnResult,
   TokenUsage,
 } from '@noetic-tools/types';
-import { assistantMessageItem, functionCallItem } from './items';
+import { assistantMessageItem, functionCallItem, reasoningItem } from './items';
 
 interface CollectedToolCall {
   toolCallId: string;
@@ -98,6 +98,12 @@ export class SubHarnessTurnAccumulator {
     harnessMetadata?: Record<string, unknown>;
   }): SubHarnessTurnResult {
     const items: Item[] = [];
+    // Reasoning first — it precedes the answer in the agent's actual turn
+    // order, and dropping it here (as the accumulator used to) meant the item
+    // log, checkpoints, and eval scorers never saw the agent's thinking.
+    if (this.reasoning.length > 0) {
+      items.push(reasoningItem(this.reasoning));
+    }
     if (this.text.length > 0) {
       items.push(assistantMessageItem(this.text));
     }
