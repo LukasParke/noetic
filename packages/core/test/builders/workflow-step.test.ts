@@ -217,6 +217,11 @@ describe('step.workflow — execution', () => {
         kind: 'tool',
         id: 'use-tool',
         toolName: tool.name,
+        // `args` must satisfy the tool's declared input schema: tool nodes
+        // dispatch through `executeToolCall`, which validates before execute.
+        args: {
+          query: 'in',
+        },
       },
     };
     const withTools = stepWorkflow({

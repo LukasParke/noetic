@@ -8,8 +8,11 @@ import type {
   AgentHarnessContract,
   Context,
   ExecuteStepFn,
+  OutputCodec,
   Span,
   Step,
+  SubHarness,
+  SubHarnessKind,
   Tool,
 } from '@noetic-tools/types';
 import { frameworkCast, NoeticConfigError } from '@noetic-tools/types';
@@ -18,7 +21,7 @@ import type { HydrationContext } from '../builders/workflow-hydrator';
 import { hydrateWorkflow } from '../builders/workflow-hydrator';
 import { NoeticAttr } from '../observability/genai-attributes';
 import type { WorkflowDocument } from '../schemas/workflow';
-import { WorkflowDocumentSchema, workflowDepth, workflowGraph } from '../schemas/workflow';
+import { validateWorkflow, workflowDepth, workflowGraph } from '../schemas/workflow';
 
 //#region Types
 
@@ -29,6 +32,16 @@ export interface DynamicWorkflowOpts {
   tools: Tool[];
   maxDepth?: number;
   maxRevisions?: number;
+  /**
+   * Registries forwarded to hydration, mirroring `HydrationContext`. The
+   * planner instructions advertise sub-harness and subflow nodes — without
+   * `subHarnesses` here a generated `claude-code` node can never resolve, and
+   * without `workflows` a generated `subflow` ref cannot either.
+   */
+  layers?: ReadonlyMap<string, ContextLayer>;
+  subHarnesses?: ReadonlyMap<SubHarnessKind, SubHarness>;
+  uiLibraries?: ReadonlyMap<string, OutputCodec>;
+  workflows?: ReadonlyMap<string, WorkflowDocument>;
 }
 
 //#endregion
@@ -79,6 +92,10 @@ Respond with ONLY the JSON document, no markdown fences or explanation.`;
  * @param opts.tools - Tools the generated workflow may reference by name.
  * @param opts.maxDepth - Maximum workflow tree depth. Default: 5.
  * @param opts.maxRevisions - Retries with error feedback on validation failure. Default: 3.
+ * @param opts.layers - Context layers a generated `provide` / `spawn` node may reference by name.
+ * @param opts.subHarnesses - SubHarness adapters a generated `claude-code`/`codex`/… node resolves against.
+ * @param opts.uiLibraries - Output codecs a generated `llm` node's `output` codec ref resolves against.
+ * @param opts.workflows - Named sub-workflows a generated `subflow` node may reference via `ref`.
  * @returns A `Step` that dynamically plans and executes.
  */
 export function dynamicWorkflow(opts: DynamicWorkflowOpts): Step<ContextData, string, string> {
@@ -142,9 +159,35 @@ export function dynamicWorkflow(opts: DynamicWorkflowOpts): Step<ContextData, st
         const hydrationCtx: HydrationContext = {
           tools: toolMap,
           executeStep,
+          layers: opts.layers,
+          subHarnesses: opts.subHarnesses,
+          uiLibraries: opts.uiLibraries,
+          workflows: opts.workflows,
         };
 
-        const hydrated = hydrateWorkflow(parseResult.doc, hydrationCtx);
+        /* Hydration failures (unknown tool/harness/layer/workflow refs) are
+         * planner-repairable exactly like validation failures — the error
+         * names the missing ref and lists what IS registered. Letting them
+         * escape the loop wasted the revision budget on the most likely
+         * class of model error. Execution errors (post-hydration) still
+         * propagate: those are runtime failures, not document defects. */
+        let hydrated: Step<ContextData, string, string>;
+        try {
+          hydrated = hydrateWorkflow(parseResult.doc, hydrationCtx);
+        } catch (e) {
+          if (e instanceof NoeticConfigError) {
+            lastError = e.message;
+            if (revision === maxRevisions - 1) {
+              throw new NoeticConfigError({
+                code: 'WORKFLOW_VALIDATION_FAILED',
+                message: `Failed to generate a hydratable workflow after ${maxRevisions} attempts: ${lastError}`,
+                hint: 'The planner referenced unregistered tools/harnesses/layers/workflows. Register them in DynamicWorkflowOpts or steer the planner away from them.',
+              });
+            }
+            continue;
+          }
+          throw e;
+        }
         return frameworkCast(await executeStep(hydrated, input, ctx));
       }
 
@@ -297,15 +340,19 @@ function tryParseWorkflow(raw: unknown, maxDepth: number): ParseResult {
     };
   }
 
-  const result = WorkflowDocumentSchema.safeParse(parsed);
-  if (!result.success) {
+  // validateWorkflow = shape (ZodError) + node-id uniqueness (DUPLICATE_NODE_ID).
+  // Both are planner-repairable, so both flow into the revision loop as text.
+  let doc: WorkflowDocument;
+  try {
+    doc = validateWorkflow(parsed);
+  } catch (e) {
     return {
       ok: false,
-      error: result.error.message,
+      error: e instanceof Error ? e.message : String(e),
     };
   }
 
-  const depth = workflowDepth(result.data.root);
+  const depth = workflowDepth(doc.root);
   if (depth > maxDepth) {
     return {
       ok: false,
@@ -315,7 +362,7 @@ function tryParseWorkflow(raw: unknown, maxDepth: number): ParseResult {
 
   return {
     ok: true,
-    doc: result.data,
+    doc,
   };
 }
 

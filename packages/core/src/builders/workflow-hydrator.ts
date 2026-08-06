@@ -20,11 +20,10 @@ import type {
   SubHarnessSettings,
   SubprocessAdapter,
   Tool,
-  ToolContext,
-  ToolExecutionContext,
   Until,
 } from '@noetic-tools/types';
 import { frameworkCast, isServerToolSpec, NoeticConfigError } from '@noetic-tools/types';
+import { executeToolCall } from '../adapters/openrouter';
 import { DetachedHandleImpl } from '../runtime/detached-handle';
 import type {
   LlmWorkflowNode,
@@ -254,27 +253,46 @@ function hydrateToolNode(
           arguments: JSON.stringify(args),
         };
         execCtx.itemLog.append(callItem);
-        const layerState: ToolContext = {
-          get: <T>(_layerId: string): T | undefined => undefined,
-          set: <T>(_layerId: string, _state: T): void => {},
-        };
-        const toolCtx: ToolExecutionContext = {
-          ctx: execCtx,
+        /* Dispatch through `executeToolCall`, NOT `resolved.execute` directly:
+         * a workflow document's args are opaque JSON (z.record(z.unknown()))
+         * and — via dynamicWorkflow — may be model-generated, so this call
+         * must pass the same gates the model tool-loop does: Zod argument
+         * validation, steering hooks, the real layer bridge built by
+         * `buildToolExecutionContext`, and tool-UI emission. Calling
+         * execute() directly was a validation bypass. */
+        const call = await executeToolCall({
+          toolName: node.toolName,
+          args,
+          tools: [
+            resolved,
+          ],
+          context: execCtx,
           harness: execCtx.harness,
-          fs: execCtx.fs,
-          shell: execCtx.shell,
-          context: layerState,
-          // Deprecated alias — the same accessor object, as
-          // `buildToolExecutionContext` does. `Tool.execute` takes its second
-          // argument as `unknown`, so nothing here is structurally checked
-          // against `ToolExecutionContext`; the annotation above is what makes
-          // a missing field a compile error instead of a runtime `undefined`.
-          memory: layerState,
-          assembledView: execCtx.itemLog.items,
-          lastStepMeta: execCtx.lastStepMeta,
-        };
-        const result = await resolved.execute(args, toolCtx);
-        return stringifyResult(result);
+          layers: execCtx.layers
+            ? [
+                ...execCtx.layers,
+              ]
+            : undefined,
+          callId,
+          resolvedTool: resolved,
+        });
+        /* Close the transcript pair: a function_call with no matching output
+         * item is an asymmetric transcript some providers reject outright. */
+        execCtx.itemLog.append({
+          id: `${callId}-output`,
+          type: 'function_call_output' as const,
+          status: 'completed' as const,
+          callId,
+          output: call.output,
+        });
+        if (call.error) {
+          throw new NoeticConfigError({
+            code: 'WORKFLOW_TOOL_CALL_FAILED',
+            message: `Tool '${node.toolName}' in workflow node '${node.id}' failed: ${call.output}`,
+            hint: 'Check the node `args` against the tool input schema, and the harness approval configuration for approval-gated tools.',
+          });
+        }
+        return call.result !== undefined ? stringifyResult(call.result) : call.output;
       },
     }),
   );
@@ -320,7 +338,8 @@ function hydrateBranchNode(
   }
 
   const hydratedRoutes = node.routes.map((r) => ({
-    match: r.match,
+    match: r.match.toLowerCase(),
+    exact: r.matchMode === 'exact',
     target: hydrateNode(r.target, ctx),
   }));
   const defaultTarget = node.default ? hydrateNode(node.default, ctx) : null;
@@ -330,12 +349,14 @@ function hydrateBranchNode(
     allTargets.push(defaultTarget);
   }
 
+  // Case-insensitive; first match wins (routes tested in declaration order).
+  // `substring` is the default; `exact` requires the whole (trimmed) input.
   return branch({
     id: node.id,
     route: (input: string) => {
       const trimmed = input.trim().toLowerCase();
       for (const r of hydratedRoutes) {
-        if (trimmed.includes(r.match.toLowerCase())) {
+        if (r.exact ? trimmed === r.match : trimmed.includes(r.match)) {
           return r.target;
         }
       }
@@ -360,20 +381,35 @@ function hydrateForkNode(
   const eachTemplate = node.each;
   const staticPaths = dynamic ? [] : (node.paths ?? []).map((p) => hydrateNode(p, ctx));
 
+  /* Per-index hydration cache for the dynamic form. The template's hydration
+   * (and its side effect: builder registration in the step registry) depends
+   * only on the INDEX, not the item — the item flows in as runtime input. So
+   * a fork invoked repeatedly (inside a loop, across turns) reuses one
+   * hydrated step per index instead of re-hydrating and re-registering the
+   * same `-${i}` ids on every invocation — which grew the registry without
+   * bound and re-did hydration work per item per call. Bounded by the widest
+   * array this fork ever sees. */
+  const perIndexSteps = new Map<number, Step<ContextData, string, string>>();
+
   const pathsFactory = (input: string): Step<ContextData, string, string>[] => {
     if (!dynamic || !eachTemplate) {
       return staticPaths;
     }
     const items = selectArray(input, node.over, node.id);
-    return items.map((item, i) =>
-      buildPerItemStep({
+    return items.map((item, i) => {
+      let hydrated = perIndexSteps.get(i);
+      if (!hydrated) {
+        hydrated = hydrateNode(suffixNodeIds(eachTemplate, `-${i}`), ctx);
+        perIndexSteps.set(i, hydrated);
+      }
+      return buildPerItemStep({
         forkId: node.id,
-        eachTemplate,
+        hydratedEach: hydrated,
         item,
         index: i,
         ctx,
-      }),
-    );
+      });
+    });
   };
   const optimizable = dynamic ? undefined : frameworkCast<Step<ContextData>[]>(staticPaths);
 
@@ -510,6 +546,21 @@ function hydrateLoopNode(
   });
 }
 
+/**
+ * A `sequence` hydrates to a single `step.run` wrapper that dispatches its
+ * children through `ctx.executeStep` — there is no first-class sequence step
+ * kind. Known consequences of that choice (accepted for now):
+ *
+ *   - Children still execute through the normal interpreter (per-child ledger
+ *     paths, events, checkpoints), but the wrapper ALSO records its aggregate
+ *     output, so on resume a fully-completed sequence replays as one unit.
+ *   - Traces/events show the wrapper as a `run` step, not a `sequence`.
+ *   - The children are invisible to the optimizer (`_optimizable` metadata is
+ *     a branch/fork concept); GEPA cannot rewrite inside a JSON sequence.
+ *
+ * If sequences become an optimization target, promote this to a first-class
+ * builder rather than growing the wrapper.
+ */
 function hydrateSequenceNode(
   node: WorkflowNode,
   ctx: HydrationContext,
@@ -779,19 +830,20 @@ function selectArray(input: string, over: string | undefined, nodeId: string): u
 
 /**
  * Builds one fork path for a single dynamic-fork item. The item is injected as
- * the body's input (forks pass the same fork-input to every path), and the
- * template's node ids are suffixed with `-${i}` so each instantiation has
- * unique ids for tracing and step-registry uniqueness.
+ * the body's input (forks pass the same fork-input to every path); the caller
+ * supplies the (cached) hydrated body whose node ids were suffixed with
+ * `-${index}` for tracing and step-registry uniqueness. The thin wrapper is
+ * rebuilt per invocation because it closes over the ITEM, which changes per
+ * call — but it reuses its id, so the registry stays bounded.
  */
 function buildPerItemStep(opts: {
   forkId: string;
-  eachTemplate: WorkflowNode;
+  hydratedEach: Step<ContextData, string, string>;
   item: unknown;
   index: number;
   ctx: HydrationContext;
 }): Step<ContextData, string, string> {
-  const { forkId, eachTemplate, item, index, ctx } = opts;
-  const hydratedEach = hydrateNode(suffixNodeIds(eachTemplate, `-${index}`), ctx);
+  const { forkId, hydratedEach, item, index, ctx } = opts;
   return frameworkCast(
     step.run({
       id: `${forkId}-item-${index}`,
@@ -895,11 +947,13 @@ async function runCodeViaSubprocess(opts: {
       code,
     ],
     stdin: input,
+    /* Identification only. The code and input already travel in `args` /
+     * `stdin` — duplicating them here doubled every request's footprint
+     * (and anything that persists request metadata, e.g. durable adapters,
+     * paid it twice). */
     metadata: {
       noeticRun: true,
       stepId: nodeId,
-      code,
-      input,
     },
   };
   const spawnPromise = adapter.spawn(request);
