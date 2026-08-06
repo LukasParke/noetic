@@ -79,6 +79,15 @@ export function createEvalContext(step: Step, options: EvalSuiteOptions): EvalCo
         name: 'eval',
         params: {},
         traceExporter: exporter,
+        // Default to OpenRouter when a key is available so eval suites with
+        // real `step.llm` agents run without each file wiring a provider.
+        ...(process.env.OPENROUTER_API_KEY
+          ? {
+              llm: {
+                provider: 'openrouter' as const,
+              },
+            }
+          : {}),
       });
 
       const ctx = harness.createContext();

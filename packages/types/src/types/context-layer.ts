@@ -378,12 +378,16 @@ export interface ContextLayerHooks<TState = unknown> {
   store?(params: StoreParams<TState>): Promise<StoreResult<TState> | undefined>;
   onSpawn?(params: SpawnParams<TState>): Promise<SpawnResult<TState> | null>;
   onReturn?(params: ReturnParams<TState>): Promise<ReturnResult<TState> | undefined>;
-  onComplete?(params: CompleteParams<TState>): Promise<
-    | undefined
-    | {
-        state: TState;
-      }
-  >;
+  onComplete?(params: CompleteParams<TState>):
+    | Promise<
+        | undefined
+        | {
+            state: TState;
+          }
+      >
+    // Layers that only record side effects legitimately return nothing from
+    // onComplete — Promise<void> hooks must stay assignable.
+    | Promise<void>;
   dispose?(params: DisposeParams<TState>): Promise<void>;
   beforeToolCall?(params: BeforeToolCallParams<TState>): Promise<BeforeToolCallResult<TState>>;
   afterModelCall?(params: AfterModelCallParams<TState>): Promise<AfterModelCallResult<TState>>;

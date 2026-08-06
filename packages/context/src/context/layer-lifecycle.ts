@@ -937,12 +937,16 @@ export async function completeLayers({
     try {
       const timeout = layer.timeouts?.onComplete ?? 3e4;
       const result = await withTimeout(
-        layer.hooks.onComplete({
-          log,
-          ctx,
-          state,
-          outcome,
-        }),
+        layer.hooks
+          .onComplete({
+            log,
+            ctx,
+            state,
+            outcome,
+          })
+          // Normalize the void-returning overload to undefined so the
+          // timeout wrapper sees a single promise type.
+          .then((r) => r ?? undefined),
         timeout,
       );
       if (result && 'state' in result) {
