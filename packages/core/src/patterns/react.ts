@@ -1,4 +1,4 @@
-import type { ContextConfig, ContextData, ContextLayer } from '@noetic-tools/context';
+import type { ContextData, ContextInput } from '@noetic-tools/context';
 import type { StepLoop, StepSpawn, Tool } from '@noetic-tools/types';
 import { resolveContextOption } from '../builders/context-option';
 import { loop } from '../builders/loop-builder';
@@ -20,9 +20,9 @@ export function react(opts: {
   tools: Tool[];
   maxSteps?: number;
   maxCost?: number;
-  context?: ContextConfig | ContextLayer[];
+  context?: ContextInput;
   /** @deprecated Renamed to `context`. */
-  memory?: ContextConfig | ContextLayer[];
+  memory?: ContextInput;
 }): StepLoop<ContextData, string, string> | StepSpawn<ContextData, string, string> {
   const llmStep = step.llm<ContextData, string, string>({
     id: 'react-step',

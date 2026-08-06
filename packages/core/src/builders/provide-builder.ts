@@ -1,4 +1,4 @@
-import type { ContextConfig, ContextData, ContextLayer } from '@noetic-tools/context';
+import type { ContextData, ContextInput } from '@noetic-tools/context';
 import type { Step, StepProvide } from '@noetic-tools/types';
 import { NoeticConfigError } from '@noetic-tools/types';
 import { getDefaultRegistrar } from '../types/step-registrar';
@@ -25,9 +25,9 @@ export function provide<TContext = ContextData, I = unknown, O = unknown>(opts: 
    * valid way to supply the layers. Exactly one of the two is required — the
    * runtime enforces it, the same way `id` and `child` are enforced.
    */
-  context?: ContextConfig | ContextLayer[];
+  context?: ContextInput;
   /** @deprecated Renamed to `context`. */
-  memory?: ContextConfig | ContextLayer[];
+  memory?: ContextInput;
 }): StepProvide<TContext, I, O> {
   if (!opts.id?.trim()) {
     throw new NoeticConfigError({

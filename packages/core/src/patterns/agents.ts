@@ -11,7 +11,7 @@
  * runtime's context assembly, durability, tracing, and cache behavior.
  */
 
-import type { ContextConfig, ContextData, ContextLayer } from '@noetic-tools/context';
+import type { ContextData, ContextInput } from '@noetic-tools/context';
 import type {
   Channel,
   Context,
@@ -49,7 +49,7 @@ export interface AgentDef {
   instructions?: Lazy<string | undefined, ContextData>;
   tools?: Tool[];
   /** Agent-local context layers (spawn-isolated when run via asTool/quorum/teammate). */
-  context?: ContextConfig | ContextLayer[];
+  context?: ContextInput;
   /** Termination predicate. Default: `any(noToolCalls, maxSteps(10))`. */
   until?: Until;
   /** Hard iteration ceiling for the agent's loop. Default 25. */
