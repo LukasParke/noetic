@@ -1,6 +1,6 @@
 # OpenRouter fork upstreaming plan
 
-Status: active
+Status: external blockers only — all controllable PR checks green
 Owner: Pi orchestrator in Herdr workspace `w10`
 Upstream base: `origin/main` at `8a6665ba`
 Source: `fork/port/openrouter-fixes` at `6df9b785` (old base `ead54108`)
@@ -152,6 +152,10 @@ Every retained implementation PR must:
 | 18 | `lukeparke/openrouter-context-input` | [#77](https://github.com/mattapperson/noetic/pull/77) | rerun pending after deterministic retry-test fix | no feedback | independent | 2026-08-13 fix pushed |
 | 19 | — | — | — | — | proposal committed at `docs/plans/2026-08-12-002-multi-agent-patterns-proposal.md`; recommends examples/docs and rejects core policy reversal | 2026-08-12 design proposal complete |
 | 20 | — | — | — | — | deferred/redesign required: examples cannot be declarative hydration targets; requires accepted package/registry plus item 14 | 2026-08-12 explicitly blocked |
+
+## Gate status
+
+As of 2026-08-13, every open upstream PR in the program is mergeable with CI, DCO, and Structural gate green and no review feedback. The only red checks are external repository configuration shared by every PR: `compat` receives no `OPENROUTER_API_KEY`, and Vercel requires upstream authorization. These blockers are documented on the PRs and cannot be remediated from the fork.
 
 ## Program risks
 
