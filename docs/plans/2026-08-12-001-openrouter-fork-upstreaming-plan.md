@@ -135,21 +135,21 @@ Every retained implementation PR must:
 | 1 | `lukeparke/openrouter-file-storage` | [#70](https://github.com/mattapperson/noetic/pull/70) | CI/DCO/structural pass; compat blocked by missing upstream `OPENROUTER_API_KEY` | no feedback | review-ready; external compat dependency documented | 2026-08-12 opened |
 | 2 | `lukeparke/openrouter-queue-ipc` | [#81](https://github.com/mattapperson/noetic/pull/81) | pending | no feedback | independent of #70 after split | 2026-08-12 opened |
 | 3 | `lukeparke/openrouter-sub-harness-reliability` | [#71](https://github.com/mattapperson/noetic/pull/71) | pending | no feedback | independent | 2026-08-12 opened |
-| 4 | `lukeparke/openrouter-eval-safety` | [#72](https://github.com/mattapperson/noetic/pull/72) | pending | no feedback | blocks 5 | 2026-08-12 opened |
-| 5 | `lukeparke/openrouter-gepa-hardening` | [#88](https://github.com/mattapperson/noetic/pull/88) | pending | clean-context review requested | depends on #72; rebase through main after merge | 2026-08-12 opened |
-| 6 | `lukeparke/openrouter-openui-hardening` | [#73](https://github.com/mattapperson/noetic/pull/73) | pending | no feedback | independent | 2026-08-12 opened |
+| 4 | `lukeparke/openrouter-eval-safety` | [#72](https://github.com/mattapperson/noetic/pull/72) | controllable CI/DCO/structural green; external compat/Vercel blocked | no feedback | blocks 5 | 2026-08-13 retry-test isolation pushed |
+| 5 | `lukeparke/openrouter-gepa-hardening` | [#88](https://github.com/mattapperson/noetic/pull/88) | rerun pending after deterministic retry-test fix | clean-context review requested | depends on #72; rebase through main after merge | 2026-08-13 fix pushed |
+| 6 | `lukeparke/openrouter-openui-hardening` | [#73](https://github.com/mattapperson/noetic/pull/73) | rerun pending after deterministic retry-test fix | no feedback | independent | 2026-08-13 fix pushed |
 | 7 | `lukeparke/openrouter-doom-loop` | [#74](https://github.com/mattapperson/noetic/pull/74) | pending | no feedback | independent | 2026-08-12 opened |
 | 8 | `lukeparke/openrouter-deferred-observations` | [#75](https://github.com/mattapperson/noetic/pull/75) | pending | no feedback | independent | 2026-08-12 opened |
 | 9 | `lukeparke/openrouter-filesystem-scoring` | [#76](https://github.com/mattapperson/noetic/pull/76) | pending | no feedback | breaking default | 2026-08-12 opened |
 | 10 | — | — | — | — | dropped: validation is #67; proposed global identity caches rely on unenforced Tool immutability, weaken harness isolation, do not cover direct `run()`, and expose a function-form unified-tool correctness gap. No measured benefit justifies that contract/risk. | 2026-08-12 dropped after implementation review |
 | 11 | `lukeparke/openrouter-runtime-efficiency` | [#78](https://github.com/mattapperson/noetic/pull/78) | pending | no feedback | excludes [#69](https://github.com/mattapperson/noetic/pull/69) behavior | 2026-08-12 opened |
 | 12 | `lukeparke/openrouter-session-log` | [#79](https://github.com/mattapperson/noetic/pull/79) | pending | no feedback | blocks 13 | 2026-08-12 opened |
-| 13 | `lukeparke/openrouter-delta-checkpoints` | [#86](https://github.com/mattapperson/noetic/pull/86) | pending | clean-context review recorded namespace/contract boundaries | depends on #79; rebase through main after merge | 2026-08-12 opened |
+| 13 | `lukeparke/openrouter-delta-checkpoints` | [#86](https://github.com/mattapperson/noetic/pull/86) | controllable CI/DCO/structural green; external compat/Vercel blocked | clean-context review recorded namespace/contract boundaries | depends on #79; rebase through main after merge | 2026-08-13 structural refactor + retry fix pushed |
 | 14 | `lukeparke/openrouter-workflow-hardening` | [#84](https://github.com/mattapperson/noetic/pull/84) | pending | clean-context review addressed | blocks 20 | 2026-08-12 opened |
 | 15 | `lukeparke/openrouter-compaction-primitives` | [#80](https://github.com/mattapperson/noetic/pull/80) | pending | no feedback | blocks 16 | 2026-08-12 opened |
 | 16 | `lukeparke/openrouter-compaction-runtime` | [#85](https://github.com/mattapperson/noetic/pull/85) | pending | clean-context review addressed | depends on #80; rebase through main after merge | 2026-08-12 opened |
-| 17 | `lukeparke/openrouter-deterministic-allocator` | [#87](https://github.com/mattapperson/noetic/pull/87) | pending | clean-context review addressed | depends on #80/#85; RFC/breaking; rebase through main | 2026-08-12 opened |
-| 18 | `lukeparke/openrouter-context-input` | [#77](https://github.com/mattapperson/noetic/pull/77) | pending | no feedback | independent | 2026-08-12 opened |
+| 17 | `lukeparke/openrouter-deterministic-allocator` | [#87](https://github.com/mattapperson/noetic/pull/87) | DCO/structural green; CI rerun pending after retry-test fix | clean-context review addressed | depends on #80/#85; RFC/breaking; rebase through main | 2026-08-13 history re-signed + fix pushed |
+| 18 | `lukeparke/openrouter-context-input` | [#77](https://github.com/mattapperson/noetic/pull/77) | rerun pending after deterministic retry-test fix | no feedback | independent | 2026-08-13 fix pushed |
 | 19 | — | — | — | — | proposal committed at `docs/plans/2026-08-12-002-multi-agent-patterns-proposal.md`; recommends examples/docs and rejects core policy reversal | 2026-08-12 design proposal complete |
 | 20 | — | — | — | — | deferred/redesign required: examples cannot be declarative hydration targets; requires accepted package/registry plus item 14 | 2026-08-12 explicitly blocked |
 
