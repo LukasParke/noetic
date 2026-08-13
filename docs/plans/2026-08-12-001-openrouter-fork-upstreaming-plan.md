@@ -136,7 +136,7 @@ Every retained implementation PR must:
 | 2 | `lukeparke/openrouter-queue-ipc` | [#81](https://github.com/mattapperson/noetic/pull/81) | pending | no feedback | independent of #70 after split | 2026-08-12 opened |
 | 3 | `lukeparke/openrouter-sub-harness-reliability` | [#71](https://github.com/mattapperson/noetic/pull/71) | pending | no feedback | independent | 2026-08-12 opened |
 | 4 | `lukeparke/openrouter-eval-safety` | [#72](https://github.com/mattapperson/noetic/pull/72) | controllable CI/DCO/structural green; external compat/Vercel blocked | no feedback | blocks 5 | 2026-08-13 retry-test isolation pushed |
-| 5 | `lukeparke/openrouter-gepa-hardening` | [#88](https://github.com/mattapperson/noetic/pull/88) | CI rerun pending; DCO/Structural green; external compat/Vercel blocked | clean-context review requested | depends on #72; rebase through main after merge | 2026-08-13 Bun `mock.module` leakage fixed at `112cde45` |
+| 5 | `lukeparke/openrouter-gepa-hardening` | [#88](https://github.com/mattapperson/noetic/pull/88) | CI/DCO/Structural green; external compat/Vercel blocked | no unresolved feedback | depends on #72; rebase through main after merge | 2026-08-13 Bun `mock.module` leakage fixed at `112cde45` |
 | 6 | `lukeparke/openrouter-openui-hardening` | [#73](https://github.com/mattapperson/noetic/pull/73) | rerun pending after deterministic retry-test fix | no feedback | independent | 2026-08-13 fix pushed |
 | 7 | `lukeparke/openrouter-doom-loop` | [#74](https://github.com/mattapperson/noetic/pull/74) | pending | no feedback | independent | 2026-08-12 opened |
 | 8 | `lukeparke/openrouter-deferred-observations` | [#75](https://github.com/mattapperson/noetic/pull/75) | pending | no feedback | independent | 2026-08-12 opened |
