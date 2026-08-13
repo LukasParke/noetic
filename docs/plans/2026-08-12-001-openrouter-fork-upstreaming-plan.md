@@ -141,7 +141,7 @@ Every retained implementation PR must:
 | 7 | `lukeparke/openrouter-doom-loop` | [#74](https://github.com/mattapperson/noetic/pull/74) | pending | no feedback | independent | 2026-08-12 opened |
 | 8 | `lukeparke/openrouter-deferred-observations` | [#75](https://github.com/mattapperson/noetic/pull/75) | pending | no feedback | independent | 2026-08-12 opened |
 | 9 | `lukeparke/openrouter-filesystem-scoring` | [#76](https://github.com/mattapperson/noetic/pull/76) | pending | no feedback | breaking default | 2026-08-12 opened |
-| 10 | — | — | — | — | deferred after review found function-tool correctness and mutation-contract gaps; validation dropped via #67 | 2026-08-12 implementation rejected pending redesign |
+| 10 | — | — | — | — | dropped: validation is #67; proposed global identity caches rely on unenforced Tool immutability, weaken harness isolation, do not cover direct `run()`, and expose a function-form unified-tool correctness gap. No measured benefit justifies that contract/risk. | 2026-08-12 dropped after implementation review |
 | 11 | `lukeparke/openrouter-runtime-efficiency` | [#78](https://github.com/mattapperson/noetic/pull/78) | pending | no feedback | excludes [#69](https://github.com/mattapperson/noetic/pull/69) behavior | 2026-08-12 opened |
 | 12 | `lukeparke/openrouter-session-log` | [#79](https://github.com/mattapperson/noetic/pull/79) | pending | no feedback | blocks 13 | 2026-08-12 opened |
 | 13 | `lukeparke/openrouter-delta-checkpoints` | [#86](https://github.com/mattapperson/noetic/pull/86) | pending | clean-context review recorded namespace/contract boundaries | depends on #79; rebase through main after merge | 2026-08-12 opened |
